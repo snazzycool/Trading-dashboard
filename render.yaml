@@ -1,0 +1,23 @@
+# render.yaml — Render deployment configuration
+# This deploys the backend as a Web Service.
+# The frontend is built and served as static files by FastAPI.
+
+services:
+  - type: web
+    name: trading-signal-dashboard
+    runtime: python
+    rootDir: backend
+    buildCommand: |
+      pip install -r requirements.txt
+      cd ../frontend && npm install && npm run build
+      cp -r ../frontend/dist ./dist
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TWELVEDATA_API_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: signal-data
+      mountPath: /data
+      sizeGB: 1
