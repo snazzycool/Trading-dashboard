@@ -143,7 +143,7 @@ def stop_scanner():
 
 # ── Serve React frontend (production) ─────────────────────────────────────
 
-_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "dist")
 
 if os.path.isdir(_FRONTEND_DIST):
     app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
