@@ -1,13 +1,16 @@
 """
-modules/strategy.py — Signal scoring engine (same logic as the Telegram bot).
+modules/strategy.py — Signal scoring engine.
 
-Scoring:
+Scoring model (max 8 points, minimum 5 to fire):
   +2  Trend confirmation  (EMA50/200 on both timeframes)
   +1  RSI pullback        (< 40 BUY / > 60 SELL)
   +2  Market structure    (price near swing low/high)
   +1  ATR volatility      (ATR above rolling average)
   +2  Liquidity sweep     (price swept H/L then reversed)
-  Max 8 — requires ≥ 5 to fire
+
+XAU/USD special handling:
+  Gold uses a wider swing proximity threshold (0.8% vs 0.3% for forex)
+  because gold moves in much larger nominal ranges.
 """
 import logging
 from dataclasses import dataclass, field
@@ -17,6 +20,7 @@ import pandas as pd
 import config
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SignalResult:
@@ -30,13 +34,16 @@ class SignalResult:
     atr:             float
     risk_reward:     float
 
+
 @dataclass
 class _Card:
     total:     int  = 0
     breakdown: dict = field(default_factory=dict)
+
     def add(self, name: str, pts: int):
         self.total += pts
         self.breakdown[name] = pts
+
 
 # ── Public ────────────────────────────────────────────────────────────────
 
@@ -53,10 +60,10 @@ def evaluate_pair(
         if len(df_entry) < config.EMA_SLOW + 10 or len(df_htf) < config.EMA_SLOW + 10:
             return None
 
-        last_e   = df_entry.iloc[-1]
-        last_h   = df_htf.iloc[-1]
-        close    = float(last_e["close"])
-        atr      = float(last_e["atr"])
+        last_e = df_entry.iloc[-1]
+        last_h = df_htf.iloc[-1]
+        close  = float(last_e["close"])
+        atr    = float(last_e["atr"])
 
         if atr <= 0 or np.isnan(atr):
             return None
@@ -67,6 +74,11 @@ def evaluate_pair(
             return None
 
         direction = htf_bias
+
+        # Use wider proximity for Gold due to larger price ranges
+        is_gold = pair == "XAU/USD"
+        proximity_pct = config.GOLD_PROXIMITY_PCT if is_gold else config.SWING_PROXIMITY_PCT
+
         card = _Card()
         card.add("trend_confirmation", config.SCORE_TREND_CONFIRMATION)
 
@@ -78,7 +90,7 @@ def evaluate_pair(
         else:
             card.add("rsi_pullback", 0)
 
-        card.add("market_structure", _score_structure(df_entry, close, direction))
+        card.add("market_structure", _score_structure(df_entry, close, direction, proximity_pct))
         card.add("atr_volatility",   _score_atr(df_entry))
         card.add("liquidity_sweep",  _score_sweep(df_entry, direction))
 
@@ -102,6 +114,112 @@ def evaluate_pair(
         if rr < config.MIN_RISK_REWARD:
             return None
 
+        # Gold prices are large numbers — round to 2 decimal places
+        decimals = 2 if is_gold else 6
+
+        return SignalResult(
+            pair=pair,
+            direction=direction,
+            entry=round(close, decimals),
+            stop_loss=round(sl, decimals),
+            take_profit=round(tp, decimals),
+            score=card.total,
+            score_breakdown=card.breakdown,
+            atr=round(atr, decimals),
+            risk_reward=rr,
+        )
+    except Exception as e:
+        logger.error("Strategy error %s: %s", pair, e, exc_info=True)
+        return None
+
+
+def check_outcome(
+    direction: str, entry: float,
+    stop_loss: float, take_profit: float,
+    current_price: float
+) -> Optional[str]:
+    if direction == "BUY":
+        if current_price >= take_profit: return "WIN"
+        if current_price <= stop_loss:   return "LOSS"
+    else:
+        if current_price <= take_profit: return "WIN"
+        if current_price >= stop_loss:   return "LOSS"
+    return None
+
+
+# ── Indicators ────────────────────────────────────────────────────────────
+
+def _indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    try:
+        df = df.copy()
+        c, h, l = df["close"], df["high"], df["low"]
+        df["ema_fast"] = c.ewm(span=config.EMA_FAST, adjust=False).mean()
+        df["ema_slow"] = c.ewm(span=config.EMA_SLOW, adjust=False).mean()
+        delta = c.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        ag = gain.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        al = loss.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        rs = ag / al.replace(0, np.nan)
+        df["rsi"] = 100 - (100 / (1 + rs))
+        prev = c.shift(1)
+        tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+        df["atr"]     = tr.ewm(alpha=1 / config.ATR_PERIOD, adjust=False).mean()
+        df["atr_avg"] = df["atr"].rolling(config.ATR_AVG_PERIOD, min_periods=1).mean()
+        return df
+    except Exception as e:
+        logger.error("Indicator error: %s", e)
+        return None
+
+
+def _bias(row: pd.Series) -> str:
+    ef = row.get("ema_fast")
+    es = row.get("ema_slow")
+    if pd.isna(ef) or pd.isna(es): return "NEUTRAL"
+    if ef > es: return "BUY"
+    if ef < es: return "SELL"
+    return "NEUTRAL"
+
+
+def _score_structure(
+    df: pd.DataFrame, close: float, direction: str, proximity_pct: float
+) -> int:
+    lb = min(config.SWING_LOOKBACK, len(df) - 1)
+    recent = df.iloc[-(lb + 1):-1]
+    if direction == "BUY":
+        level = float(recent["low"].min())
+    else:
+        level = float(recent["high"].max())
+    if abs(close - level) / close <= proximity_pct:
+        return config.SCORE_MARKET_STRUCTURE
+    return 0
+
+
+def _score_atr(df: pd.DataFrame) -> int:
+    last = df.iloc[-1]
+    atr  = last.get("atr",     np.nan)
+    avg  = last.get("atr_avg", np.nan)
+    if pd.isna(atr) or pd.isna(avg) or avg == 0:
+        return 0
+    return config.SCORE_ATR_VOLATILITY if atr > avg else 0
+
+
+def _score_sweep(df: pd.DataFrame, direction: str) -> int:
+    lb = min(config.LIQUIDITY_SWEEP_BARS + config.SWING_LOOKBACK, len(df) - 2)
+    if lb < 4:
+        return 0
+    ref    = df.iloc[-(lb + 1):-(config.LIQUIDITY_SWEEP_BARS + 1)]
+    recent = df.iloc[-(config.LIQUIDITY_SWEEP_BARS + 1):]
+    try:
+        if direction == "BUY":
+            prior = float(ref["low"].min())
+            swept = recent[(recent["low"] < prior) & (recent["close"] > prior)]
+        else:
+            prior = float(ref["high"].max())
+            swept = recent[(recent["high"] > prior) & (recent["close"] < prior)]
+        return config.SCORE_LIQUIDITY_SWEEP if not swept.empty else 0
+    except Exception:
+        return 0
         return SignalResult(
             pair=pair,
             direction=direction,
