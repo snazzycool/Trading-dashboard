@@ -1,15 +1,14 @@
 """
 modules/strategy.py — Signal scoring engine.
 
-Scoring model (max 8 points — minimum 5 required to fire a signal):
+Scoring model (max 8 points, minimum 5 to fire):
   +2  Trend confirmation  EMA50/200 aligned on BOTH timeframes
   +1  RSI pullback        RSI < 40 (BUY) or > 60 (SELL)
-  +2  Market structure    Price near recent swing low (BUY) / high (SELL)
-  +1  ATR volatility      Current ATR above its rolling average
+  +2  Market structure    Price near recent swing low/high
+  +1  ATR volatility      ATR above its rolling average
   +2  Liquidity sweep     Price swept recent H/L then reversed
 
-XAU/USD (Gold) uses a wider swing proximity (0.8%) because gold
-moves in much larger nominal ranges than forex pairs (0.3%).
+XAU/USD uses wider swing proximity (0.8%) vs forex (0.3%).
 """
 import logging
 from dataclasses import dataclass, field
@@ -20,8 +19,6 @@ import config
 
 logger = logging.getLogger(__name__)
 
-
-# ── Data classes ──────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -45,8 +42,6 @@ class _Card:
         self.total += pts
         self.breakdown[name] = pts
 
-
-# ── Public entry point ────────────────────────────────────────────────────
 
 def evaluate_pair(
     pair:     str,
@@ -72,26 +67,19 @@ def evaluate_pair(
             logger.debug("%s: invalid ATR", pair)
             return None
 
-        # Both timeframes must agree on direction
         htf_bias   = _bias(last_h)
         entry_bias = _bias(last_e)
         if htf_bias == "NEUTRAL" or entry_bias == "NEUTRAL" or htf_bias != entry_bias:
-            logger.debug("%s: no TF agreement (HTF=%s entry=%s)", pair, htf_bias, entry_bias)
+            logger.debug("%s: TF conflict HTF=%s entry=%s", pair, htf_bias, entry_bias)
             return None
 
-        direction = htf_bias
-
-        # Gold needs a wider proximity due to larger price ranges
+        direction     = htf_bias
         is_gold       = (pair == "XAU/USD")
         proximity_pct = config.GOLD_PROXIMITY_PCT if is_gold else config.SWING_PROXIMITY_PCT
 
-        # ── Score ─────────────────────────────────────────────────────────
         card = _Card()
-
-        # Component 1: Trend confirmation (already verified above)
         card.add("trend_confirmation", config.SCORE_TREND_CONFIRMATION)
 
-        # Component 2: RSI pullback
         rsi = float(last_e["rsi"])
         if direction == "BUY" and rsi < config.RSI_BUY_THRESHOLD:
             card.add("rsi_pullback", config.SCORE_RSI_PULLBACK)
@@ -100,8 +88,306 @@ def evaluate_pair(
         else:
             card.add("rsi_pullback", 0)
 
-        # Component 3: Market structure (proximity_pct passed correctly)
         card.add("market_structure",
+                 _score_structure(df_entry, close, direction, proximity_pct))
+        card.add("atr_volatility", _score_atr(df_entry))
+        card.add("liquidity_sweep", _score_sweep(df_entry, direction))
+
+        logger.info("%s %s | Score %d/8 | %s", pair, direction, card.total,
+                    {k: v for k, v in card.breakdown.items() if v > 0})
+
+        if card.total < config.MIN_SCORE_TO_TRADE:
+            logger.debug("%s: score %d below threshold %d",
+                         pair, card.total, config.MIN_SCORE_TO_TRADE)
+            return None
+
+        if direction == "BUY":
+            sl = close - atr * config.ATR_SL_MULTIPLIER
+            tp = close + atr * config.ATR_TP_MULTIPLIER
+        else:
+            sl = close + atr * config.ATR_SL_MULTIPLIER
+            tp = close - atr * config.ATR_TP_MULTIPLIER
+
+        risk   = abs(close - sl)
+        reward = abs(tp - close)
+        rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+        if rr < config.MIN_RISK_REWARD:
+            logger.debug("%s: RR %.2f below minimum %.2f", pair, rr, config.MIN_RISK_REWARD)
+            return None
+
+        decimals = 2 if is_gold else 6
+
+        return SignalResult(
+            pair=pair,
+            direction=direction,
+            entry=round(close, decimals),
+            stop_loss=round(sl, decimals),
+            take_profit=round(tp, decimals),
+            score=card.total,
+            score_breakdown=card.breakdown,
+            atr=round(atr, decimals),
+            risk_reward=rr,
+        )
+
+    except Exception as e:
+        logger.error("Strategy error %s: %s", pair, e, exc_info=True)
+        return None
+
+
+def check_outcome(
+    direction:     str,
+    entry:         float,
+    stop_loss:     float,
+    take_profit:   float,
+    current_price: float,
+) -> Optional[str]:
+    if direction == "BUY":
+        if current_price >= take_profit:
+            return "WIN"
+        if current_price <= stop_loss:
+            return "LOSS"
+    else:
+        if current_price <= take_profit:
+            return "WIN"
+        if current_price >= stop_loss:
+            return "LOSS"
+    return None
+
+
+def _indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    try:
+        df   = df.copy()
+        c    = df["close"]
+        h    = df["high"]
+        l    = df["low"]
+
+        df["ema_fast"] = c.ewm(span=config.EMA_FAST, adjust=False).mean()
+        df["ema_slow"] = c.ewm(span=config.EMA_SLOW, adjust=False).mean()
+
+        delta    = c.diff()
+        gain     = delta.clip(lower=0)
+        loss     = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        rs       = avg_gain / avg_loss.replace(0, np.nan)
+        df["rsi"] = 100 - (100 / (1 + rs))
+
+        prev = c.shift(1)
+        tr   = pd.concat(
+            [h - l, (h - prev).abs(), (l - prev).abs()], axis=1
+        ).max(axis=1)
+        df["atr"]     = tr.ewm(alpha=1 / config.ATR_PERIOD, adjust=False).mean()
+        df["atr_avg"] = df["atr"].rolling(config.ATR_AVG_PERIOD, min_periods=1).mean()
+
+        return df
+    except Exception as e:
+        logger.error("Indicator error: %s", e)
+        return None
+
+
+def _bias(row: pd.Series) -> str:
+    ef = row.get("ema_fast")
+    es = row.get("ema_slow")
+    if pd.isna(ef) or pd.isna(es):
+        return "NEUTRAL"
+    if ef > es:
+        return "BUY"
+    if ef < es:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _score_structure(
+    df:            pd.DataFrame,
+    close:         float,
+    direction:     str,
+    proximity_pct: float,
+) -> int:
+    lb     = min(config.SWING_LOOKBACK, len(df) - 1)
+    recent = df.iloc[-(lb + 1):-1]
+    if direction == "BUY":
+        level = float(recent["low"].min())
+    else:
+        level = float(recent["high"].max())
+    if abs(close - level) / close <= proximity_pct:
+        return config.SCORE_MARKET_STRUCTURE
+    return 0
+
+
+def _score_atr(df: pd.DataFrame) -> int:
+    last = df.iloc[-1]
+    atr  = last.get("atr",     np.nan)
+    avg  = last.get("atr_avg", np.nan)
+    if pd.isna(atr) or pd.isna(avg) or avg == 0:
+        return 0
+    if atr > avg:
+        return config.SCORE_ATR_VOLATILITY
+    return 0
+
+
+def _score_sweep(df: pd.DataFrame, direction: str) -> int:
+    lb = min(config.LIQUIDITY_SWEEP_BARS + config.SWING_LOOKBACK, len(df) - 2)
+    if lb < 4:
+        return 0
+    ref    = df.iloc[-(lb + 1):-(config.LIQUIDITY_SWEEP_BARS + 1)]
+    recent = df.iloc[-(config.LIQUIDITY_SWEEP_BARS + 1):]
+    try:
+        if direction == "BUY":
+            prior = float(ref["low"].min())
+            swept = recent[
+                (recent["low"] < prior) & (recent["close"] > prior)
+            ]
+        else:
+            prior = float(ref["high"].max())
+            swept = recent[
+                (recent["high"] > prior) & (recent["close"] < prior)
+            ]
+        if not swept.empty:
+            return config.SCORE_LIQUIDITY_SWEEP
+        return 0
+    except Exception:
+        return 0
+        risk   = abs(close - sl)
+        reward = abs(tp - close)
+        rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+        if rr < config.MIN_RISK_REWARD:
+            logger.debug("%s: RR %.2f below minimum %.2f", pair, rr, config.MIN_RISK_REWARD)
+            return None
+
+        decimals = 2 if is_gold else 6
+
+        return SignalResult(
+            pair=pair,
+            direction=direction,
+            entry=round(close, decimals),
+            stop_loss=round(sl, decimals),
+            take_profit=round(tp, decimals),
+            score=card.total,
+            score_breakdown=card.breakdown,
+            atr=round(atr, decimals),
+            risk_reward=rr,
+        )
+
+    except Exception as e:
+        logger.error("Strategy error %s: %s", pair, e, exc_info=True)
+        return None
+
+
+def check_outcome(
+    direction:     str,
+    entry:         float,
+    stop_loss:     float,
+    take_profit:   float,
+    current_price: float,
+) -> Optional[str]:
+    if direction == "BUY":
+        if current_price >= take_profit:
+            return "WIN"
+        if current_price <= stop_loss:
+            return "LOSS"
+    else:
+        if current_price <= take_profit:
+            return "WIN"
+        if current_price >= stop_loss:
+            return "LOSS"
+    return None
+
+
+def _indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    try:
+        df   = df.copy()
+        c    = df["close"]
+        h    = df["high"]
+        l    = df["low"]
+
+        df["ema_fast"] = c.ewm(span=config.EMA_FAST, adjust=False).mean()
+        df["ema_slow"] = c.ewm(span=config.EMA_SLOW, adjust=False).mean()
+
+        delta    = c.diff()
+        gain     = delta.clip(lower=0)
+        loss     = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / config.RSI_PERIOD, adjust=False).mean()
+        rs       = avg_gain / avg_loss.replace(0, np.nan)
+        df["rsi"] = 100 - (100 / (1 + rs))
+
+        prev = c.shift(1)
+        tr   = pd.concat(
+            [h - l, (h - prev).abs(), (l - prev).abs()], axis=1
+        ).max(axis=1)
+        df["atr"]     = tr.ewm(alpha=1 / config.ATR_PERIOD, adjust=False).mean()
+        df["atr_avg"] = df["atr"].rolling(config.ATR_AVG_PERIOD, min_periods=1).mean()
+
+        return df
+    except Exception as e:
+        logger.error("Indicator error: %s", e)
+        return None
+
+
+def _bias(row: pd.Series) -> str:
+    ef = row.get("ema_fast")
+    es = row.get("ema_slow")
+    if pd.isna(ef) or pd.isna(es):
+        return "NEUTRAL"
+    if ef > es:
+        return "BUY"
+    if ef < es:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _score_structure(
+    df:            pd.DataFrame,
+    close:         float,
+    direction:     str,
+    proximity_pct: float,
+) -> int:
+    lb     = min(config.SWING_LOOKBACK, len(df) - 1)
+    recent = df.iloc[-(lb + 1):-1]
+    if direction == "BUY":
+        level = float(recent["low"].min())
+    else:
+        level = float(recent["high"].max())
+    if abs(close - level) / close <= proximity_pct:
+        return config.SCORE_MARKET_STRUCTURE
+    return 0
+
+
+def _score_atr(df: pd.DataFrame) -> int:
+    last = df.iloc[-1]
+    atr  = last.get("atr",     np.nan)
+    avg  = last.get("atr_avg", np.nan)
+    if pd.isna(atr) or pd.isna(avg) or avg == 0:
+        return 0
+    if atr > avg:
+        return config.SCORE_ATR_VOLATILITY
+    return 0
+
+
+def _score_sweep(df: pd.DataFrame, direction: str) -> int:
+    lb = min(config.LIQUIDITY_SWEEP_BARS + config.SWING_LOOKBACK, len(df) - 2)
+    if lb < 4:
+        return 0
+    ref    = df.iloc[-(lb + 1):-(config.LIQUIDITY_SWEEP_BARS + 1)]
+    recent = df.iloc[-(config.LIQUIDITY_SWEEP_BARS + 1):]
+    try:
+        if direction == "BUY":
+            prior = float(ref["low"].min())
+            swept = recent[
+                (recent["low"] < prior) & (recent["close"] > prior)
+            ]
+        else:
+            prior = float(ref["high"].max())
+            swept = recent[
+                (recent["high"] > prior) & (recent["close"] < prior)
+            ]
+        if not swept.empty:
+            return config.SCORE_LIQUIDITY_SWEEP
+        return 0
+    except Exception:
+        return 0        card.add("market_structure",
                  _score_structure(df_entry, close, direction, proximity_pct))
 
         # Component 4: ATR volatility
