@@ -22,20 +22,20 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH: str = os.path.join(_DATA_DIR, "signals.db")
 
 # ── Scanner ───────────────────────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS: int = 1800          # 30 minutes (free tier safe)
-RESULT_CHECK_INTERVAL_SECONDS: int = 1800  # 30 minutes
+# 30-minute scan interval keeps daily API usage well within free tier
+SCAN_INTERVAL_SECONDS: int         = 1800
+RESULT_CHECK_INTERVAL_SECONDS: int = 1800
 
 # ── Watchlist ─────────────────────────────────────────────────────────────
 # 7 pairs × 2 timeframes × 48 scans/day = 672 credits/day (limit: 800) ✅
-# No crypto — replaced with stronger forex pairs + Gold
 WATCHLIST: list[str] = [
-    "EUR/USD",   # Most liquid forex — benchmark pair
+    "EUR/USD",   # Most liquid forex pair
     "GBP/USD",   # High volatility, strong trends
-    "GBP/JPY",   # Very volatile, excellent for ATR-based signals
-    "EUR/JPY",   # Active London/Tokyo overlap, strong trends
-    "AUD/USD",   # Commodity-linked, good trend behaviour
-    "USD/CAD",   # Oil-linked, reliable structure
-    "XAU/USD",   # Gold — volatile, trending, best for signals
+    "GBP/JPY",   # Very volatile, excellent ATR-based signals
+    "EUR/JPY",   # Active London/Tokyo overlap
+    "AUD/USD",   # Commodity-linked, reliable trends
+    "USD/CAD",   # Oil-linked, solid structure
+    "XAU/USD",   # Gold — volatile, trending, high-quality signals
 ]
 
 ENTRY_INTERVAL: str = "15min"
@@ -52,24 +52,16 @@ SCORE_ATR_VOLATILITY:     int = 1
 SCORE_LIQUIDITY_SWEEP:    int = 2
 
 # ── Indicators ────────────────────────────────────────────────────────────
-EMA_FAST:            int   = 50
-EMA_SLOW:            int   = 200
-RSI_PERIOD:          int   = 14
-RSI_BUY_THRESHOLD:   float = 40.0
-RSI_SELL_THRESHOLD:  float = 60.0
-ATR_PERIOD:          int   = 14
-ATR_AVG_PERIOD:      int   = 50
-SWING_LOOKBACK:      int   = 20
-ATR_PERIOD:          int   = 14
-ATR_AVG_PERIOD:      int   = 50
-SWING_LOOKBACK:      int   = 20
-
-# Gold (XAU/USD) moves in much larger price ranges than forex pairs.
-# We use a wider proximity threshold so market structure is still detected.
-# For all other pairs: 0.3% proximity. For Gold: 0.8% proximity.
-# This is handled automatically in strategy.py using GOLD_PROXIMITY_PCT.
-SWING_PROXIMITY_PCT:  float = 0.003   # 0.3% for forex pairs
-GOLD_PROXIMITY_PCT:   float = 0.008   # 0.8% for XAU/USD
+EMA_FAST:             int   = 50
+EMA_SLOW:             int   = 200
+RSI_PERIOD:           int   = 14
+RSI_BUY_THRESHOLD:    float = 40.0
+RSI_SELL_THRESHOLD:   float = 60.0
+ATR_PERIOD:           int   = 14
+ATR_AVG_PERIOD:       int   = 50
+SWING_LOOKBACK:       int   = 20
+SWING_PROXIMITY_PCT:  float = 0.003   # 0.3% for all forex pairs
+GOLD_PROXIMITY_PCT:   float = 0.008   # 0.8% for XAU/USD (wider range)
 LIQUIDITY_SWEEP_BARS: int   = 5
 
 # ── Risk management ───────────────────────────────────────────────────────
@@ -83,7 +75,6 @@ MAX_SIGNALS_PER_HOUR:   int = 6     # Hard cap across all pairs per hour
 
 # ── Session filter (UTC hours) ────────────────────────────────────────────
 # London: 07:00–16:00 UTC  |  New York: 12:00–21:00 UTC
-# XAU/USD is most active during London open (07:00–10:00 UTC)
 # Set to None to scan 24/7
 ACTIVE_SESSION_HOURS: list[tuple[int, int]] | None = [
     (7, 16),   # London session
