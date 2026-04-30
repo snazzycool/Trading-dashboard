@@ -1,6 +1,5 @@
 """
-modules/scanner.py — Background scanner that runs every 5 minutes.
-Broadcasts new signals and result updates to all connected WebSocket clients.
+modules/scanner.py
 """
 import asyncio
 import logging
@@ -17,22 +16,21 @@ from modules import strategy as strat
 
 logger = logging.getLogger(__name__)
 
-_executor  = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=4)
 _scheduler = AsyncIOScheduler(timezone="UTC")
-
-# Set of active WebSocket send-functions — populated by main.py
 _ws_clients: set = set()
-
 _MAX_SIGNAL_AGE_HOURS = 24
+
 
 def register_client(send_fn):
     _ws_clients.add(send_fn)
 
+
 def unregister_client(send_fn):
     _ws_clients.discard(send_fn)
 
+
 async def _broadcast(event: str, payload: dict):
-    """Send a JSON event to every connected browser."""
     msg = json.dumps({"event": event, "data": payload})
     dead = set()
     for send_fn in list(_ws_clients):
@@ -43,24 +41,19 @@ async def _broadcast(event: str, payload: dict):
     for fn in dead:
         _ws_clients.discard(fn)
 
-# ── Scanner job ───────────────────────────────────────────────────────────
 
 async def scan_markets():
     if db.get_state("scanner_active", "off") != "on":
-        logger.debug("Scanner paused.")
         return
 
     if not md.is_active_session():
-        logger.debug("Outside active session.")
-        await _broadcast("scanner_status", {"message": "Outside trading session — waiting"})
+        await _broadcast("scanner_status", {"message": "Outside trading session — waiting", "scanning": False})
         return
 
     if db.count_signals_last_hour() >= config.MAX_SIGNALS_PER_HOUR:
-        logger.info("Hourly cap reached.")
-        await _broadcast("scanner_status", {"message": "Hourly signal cap reached — pausing"})
+        await _broadcast("scanner_status", {"message": "Hourly signal cap reached — pausing", "scanning": False})
         return
 
-    logger.info("Scan started — %d pairs", len(config.WATCHLIST))
     await _broadcast("scanner_status", {
         "message": f"Scanning {len(config.WATCHLIST)} pairs…",
         "scanning": True,
@@ -78,9 +71,7 @@ async def scan_markets():
             continue
 
         try:
-            df_entry, df_htf = await loop.run_in_executor(
-                _executor, _fetch_pair, pair
-            )
+            df_entry, df_htf = await loop.run_in_executor(_executor, _fetch_pair, pair)
             if df_entry is None or df_htf is None:
                 continue
 
@@ -98,18 +89,20 @@ async def scan_markets():
                 score_breakdown=signal.score_breakdown,
                 atr=signal.atr,
                 risk_reward=signal.risk_reward,
+                pip_risk=signal.pip_risk,
+                pip_reward=signal.pip_reward,
             )
 
             if sig_id < 0:
                 continue
 
-            # Build full signal dict for broadcast
             sig_dict = db.get_signal_by_id(sig_id)
             if sig_dict:
-                await _broadcast("new_signal", _serialize_signal(sig_dict))
+                await _broadcast("new_signal", _serialize(sig_dict))
                 signals_sent += 1
-                logger.info("Signal broadcast: %s %s score=%d",
-                            pair, signal.direction, signal.score)
+                logger.info("Signal: %s %s score=%d pips risk=%.0f reward=%.0f",
+                            pair, signal.direction, signal.score,
+                            signal.pip_risk, signal.pip_reward)
 
         except Exception as e:
             logger.error("Error scanning %s: %s", pair, e, exc_info=True)
@@ -119,23 +112,18 @@ async def scan_markets():
         "scanning": False,
         "last_scan": datetime.utcnow().isoformat(),
     })
-    logger.info("Scan complete. Signals sent: %d", signals_sent)
+
 
 def _fetch_pair(pair: str):
-    df_entry = md.get_candles(pair, config.ENTRY_INTERVAL)
-    df_htf   = md.get_candles(pair, config.HTF_INTERVAL)
-    return df_entry, df_htf
+    return md.get_candles(pair, config.ENTRY_INTERVAL), md.get_candles(pair, config.HTF_INTERVAL)
 
-# ── Result checker ─────────────────────────────────────────────────────────
 
 async def check_results():
     pending = db.get_pending_signals()
     if not pending:
         return
 
-    logger.info("Checking %d pending signal(s)", len(pending))
     loop = asyncio.get_event_loop()
-
     for sig in pending:
         try:
             created = datetime.fromisoformat(sig["created_at"])
@@ -151,9 +139,7 @@ async def check_results():
                 })
                 continue
 
-            price = await loop.run_in_executor(
-                _executor, md.get_current_price, sig["pair"]
-            )
+            price = await loop.run_in_executor(_executor, md.get_current_price, sig["pair"])
             if price is None:
                 continue
 
@@ -167,11 +153,10 @@ async def check_results():
 
             if outcome:
                 db.resolve_signal(sig["id"], outcome)
-                now = datetime.utcnow().isoformat()
                 await _broadcast("signal_update", {
-                    "id":          sig["id"],
-                    "status":      outcome,
-                    "resolved_at": now,
+                    "id": sig["id"],
+                    "status": outcome,
+                    "resolved_at": datetime.utcnow().isoformat(),
                     "current_price": price,
                 })
                 logger.info("Signal #%d %s → %s", sig["id"], sig["pair"], outcome)
@@ -179,7 +164,6 @@ async def check_results():
         except Exception as e:
             logger.error("Result check error signal #%d: %s", sig["id"], e)
 
-# ── Scheduler setup ────────────────────────────────────────────────────────
 
 def start_scheduler():
     _scheduler.add_job(
@@ -197,16 +181,16 @@ def start_scheduler():
     _scheduler.start()
     logger.info("Scheduler started — scan every %ds", config.SCAN_INTERVAL_SECONDS)
 
+
 def stop_scheduler():
     if _scheduler.running:
         _scheduler.shutdown(wait=False)
 
-# ── Helper ────────────────────────────────────────────────────────────────
 
-def _serialize_signal(row: dict) -> dict:
-    import json
+def _serialize(row: dict) -> dict:
+    import json as _json
     try:
-        row["score_breakdown"] = json.loads(row.get("score_breakdown") or "{}")
+        row["score_breakdown"] = _json.loads(row.get("score_breakdown") or "{}")
     except Exception:
         row["score_breakdown"] = {}
     return row

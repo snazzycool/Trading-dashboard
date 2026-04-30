@@ -1,5 +1,5 @@
 """
-modules/database.py — SQLite persistence layer.
+modules/database.py
 """
 import sqlite3
 import logging
@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS signals (
     score_breakdown TEXT    NOT NULL DEFAULT '{}',
     atr             REAL    NOT NULL,
     risk_reward     REAL    NOT NULL DEFAULT 0,
+    pip_risk        REAL    NOT NULL DEFAULT 0,
+    pip_reward      REAL    NOT NULL DEFAULT 0,
     status          TEXT    NOT NULL DEFAULT 'PENDING'
                     CHECK(status IN ('PENDING','WIN','LOSS','EXPIRED')),
     created_at      TEXT    NOT NULL,
@@ -37,6 +39,15 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    # Add pip columns if upgrading from older schema
+    try:
+        conn.execute("ALTER TABLE signals ADD COLUMN pip_risk REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE signals ADD COLUMN pip_reward REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass
     return conn
 
 def init_db() -> None:
@@ -44,30 +55,27 @@ def init_db() -> None:
         conn.executescript(_SCHEMA)
     logger.info("Database ready: %s", config.DB_PATH)
 
-# ── Signals ───────────────────────────────────────────────────────────────
-
-def insert_signal(
-    pair: str, direction: str, entry: float,
-    stop_loss: float, take_profit: float,
-    score: int, score_breakdown: dict,
-    atr: float, risk_reward: float,
-) -> int:
+def insert_signal(pair, direction, entry, stop_loss, take_profit,
+                  score, score_breakdown, atr, risk_reward,
+                  pip_risk=0.0, pip_reward=0.0) -> int:
     import json
     now = datetime.utcnow().isoformat(timespec="seconds")
     sql = """
         INSERT INTO signals
             (pair, direction, entry, stop_loss, take_profit,
-             score, score_breakdown, atr, risk_reward, status, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,'PENDING',?)
+             score, score_breakdown, atr, risk_reward, pip_risk, pip_reward,
+             status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,'PENDING',?)
     """
     with _connect() as conn:
         cur = conn.execute(sql, (
             pair, direction, entry, stop_loss, take_profit,
-            score, json.dumps(score_breakdown), atr, risk_reward, now
+            score, json.dumps(score_breakdown), atr, risk_reward,
+            pip_risk, pip_reward, now
         ))
         return cur.lastrowid or -1
 
-def get_pending_signals() -> list[dict]:
+def get_pending_signals() -> list:
     sql = "SELECT * FROM signals WHERE status='PENDING' ORDER BY created_at"
     with _connect() as conn:
         return [dict(r) for r in conn.execute(sql).fetchall()]
@@ -80,7 +88,7 @@ def resolve_signal(signal_id: int, outcome: str) -> None:
             (outcome, now, signal_id)
         )
 
-def get_recent_signal_for_pair(pair: str, within_seconds: int) -> Optional[dict]:
+def get_recent_signal_for_pair(pair: str, within_seconds: int):
     sql = """
         SELECT * FROM signals
         WHERE pair=?
@@ -96,12 +104,12 @@ def count_signals_last_hour() -> int:
     with _connect() as conn:
         return conn.execute(sql).fetchone()[0]
 
-def get_all_signals(limit: int = 100) -> list[dict]:
+def get_all_signals(limit: int = 100) -> list:
     sql = "SELECT * FROM signals ORDER BY created_at DESC LIMIT ?"
     with _connect() as conn:
         return [dict(r) for r in conn.execute(sql, (limit,)).fetchall()]
 
-def get_signal_by_id(signal_id: int) -> Optional[dict]:
+def get_signal_by_id(signal_id: int):
     with _connect() as conn:
         row = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
         return dict(row) if row else None
@@ -118,27 +126,20 @@ def get_performance_stats() -> dict:
     """
     with _connect() as conn:
         row = dict(conn.execute(sql).fetchone())
-    wins   = row.get("wins")   or 0
+    wins = row.get("wins") or 0
     losses = row.get("losses") or 0
     resolved = wins + losses
     row["win_rate"] = round(wins / resolved * 100, 1) if resolved > 0 else 0.0
-
-    # Per-pair breakdown
     pair_sql = """
         SELECT pair,
             SUM(CASE WHEN status='WIN'  THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) as losses,
             COUNT(*) as total
-        FROM signals
-        GROUP BY pair
-        ORDER BY total DESC
+        FROM signals GROUP BY pair ORDER BY total DESC
     """
     with _connect() as conn:
-        pairs = [dict(r) for r in conn.execute(pair_sql).fetchall()]
-    row["by_pair"] = pairs
+        row["by_pair"] = [dict(r) for r in conn.execute(pair_sql).fetchall()]
     return row
-
-# ── Scanner state ──────────────────────────────────────────────────────────
 
 def set_state(key: str, value: str) -> None:
     with _connect() as conn:
