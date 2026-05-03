@@ -12,31 +12,48 @@ const STATUS_STYLE: Record<string, string> = {
 }
 
 const STATUS_ICON: Record<string, any> = {
-  PENDING: Clock, WIN: CheckCircle, LOSS: XCircle, EXPIRED: AlertCircle,
+  PENDING: Clock,
+  WIN:     CheckCircle,
+  LOSS:    XCircle,
+  EXPIRED: AlertCircle,
 }
 
+// v2 score labels (6 components, max 10)
 const SCORE_LABELS: Record<string, string> = {
-  trend_confirmation: 'Trend',
-  rsi_pullback:       'RSI',
-  market_structure:   'Structure',
-  atr_volatility:     'Volatility',
-  liquidity_sweep:    'Liq. Sweep',
+  trend_structure:  'Trend Structure',
+  rsi:              'RSI',
+  swing_proximity:  'Swing Level',
+  atr_volatility:   'Volatility',
+  liquidity_sweep:  'Sweep/ORB',
+  macd:             'MACD',
 }
 
 export function SignalCard({ signal }: Props) {
   const { setSelectedSignalId, selectedSignalId } = useStore()
-  const isSelected = selectedSignalId === signal.id
-  const StatusIcon = STATUS_ICON[signal.status] ?? Clock
+  const isSelected  = selectedSignalId === signal.id
+  const StatusIcon  = STATUS_ICON[signal.status] ?? Clock
+  const maxScore    = 10  // v2 scoring out of 10
 
   const fmt = (p: number) =>
-    signal.pair === 'XAU/USD' ? p.toFixed(2)
-    : signal.pair.includes('JPY') ? p.toFixed(3)
+    signal.pair === 'XAU/USD'        ? p.toFixed(2)
+    : signal.pair.includes('JPY')    ? p.toFixed(3)
     : p.toFixed(5)
 
-  const timeStr = new Date(signal.created_at + 'Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  const dateStr = new Date(signal.created_at + 'Z').toLocaleDateString([], { month: 'short', day: 'numeric' })
+  const timeStr = new Date(signal.created_at + 'Z').toLocaleTimeString([], {
+    hour: '2-digit', minute: '2-digit',
+  })
+  const dateStr = new Date(signal.created_at + 'Z').toLocaleDateString([], {
+    month: 'short', day: 'numeric',
+  })
+
   const pipRisk   = signal.pip_risk   ?? 0
   const pipReward = signal.pip_reward ?? 0
+
+  // Score colour based on quality
+  const scoreColor =
+    signal.score >= 9 ? 'text-emerald-400' :
+    signal.score >= 7 ? 'text-blue-400'    :
+    'text-gray-400'
 
   return (
     <div
@@ -49,28 +66,39 @@ export function SignalCard({ signal }: Props) {
           : 'border-white/6 bg-white/3 hover:bg-white/5',
       ].join(' ')}
     >
+      {/* Top row */}
       <div className="flex items-start justify-between gap-2 mb-3">
         <div className="flex items-center gap-2">
           {signal.direction === 'BUY'
             ? <TrendingUp  size={16} className="text-green-400 shrink-0" />
-            : <TrendingDown size={16} className="text-red-400   shrink-0" />}
+            : <TrendingDown size={16} className="text-red-400   shrink-0" />
+          }
           <div>
             <span className="text-white font-bold text-sm">{signal.pair}</span>
-            <span className={['ml-1.5 text-xs font-bold px-1.5 py-0.5 rounded',
-              signal.direction === 'BUY' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+            <span className={[
+              'ml-1.5 text-xs font-bold px-1.5 py-0.5 rounded',
+              signal.direction === 'BUY'
+                ? 'bg-green-500/20 text-green-400'
+                : 'bg-red-500/20 text-red-400',
             ].join(' ')}>
               {signal.direction}
             </span>
           </div>
         </div>
+
         <div className="flex flex-col items-end gap-1 shrink-0">
-          <span className={['flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border', STATUS_STYLE[signal.status]].join(' ')}>
-            <StatusIcon size={10} />{signal.status}
+          <span className={[
+            'flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border',
+            STATUS_STYLE[signal.status],
+          ].join(' ')}>
+            <StatusIcon size={10} />
+            {signal.status}
           </span>
           <span className="text-gray-600 text-xs">{dateStr} {timeStr}</span>
         </div>
       </div>
 
+      {/* Prices */}
       <div className="grid grid-cols-3 gap-1.5 mb-3">
         {[
           { label: 'Entry', value: fmt(signal.entry),       color: 'text-white' },
@@ -79,11 +107,12 @@ export function SignalCard({ signal }: Props) {
         ].map(({ label, value, color }) => (
           <div key={label} className="bg-black/20 rounded-lg p-2 text-center">
             <p className="text-gray-500 text-xs mb-0.5">{label}</p>
-            <p className={color + ' font-mono text-xs font-semibold'}>{value}</p>
+            <p className={`${color} font-mono text-xs font-semibold`}>{value}</p>
           </div>
         ))}
       </div>
 
+      {/* Pip display */}
       {(pipRisk > 0 || pipReward > 0) && (
         <div className="flex items-center justify-between mb-3 bg-black/20 rounded-lg px-3 py-2">
           <div className="text-center">
@@ -103,16 +132,27 @@ export function SignalCard({ signal }: Props) {
         </div>
       )}
 
+      {/* Score bar — out of 10 */}
       <div className="flex items-center gap-2">
         <span className="text-gray-600 text-xs">Score</span>
         <div className="flex gap-0.5 flex-1">
-          {[...Array(8)].map((_, i) => (
-            <div key={i} className={'h-1.5 flex-1 rounded-full ' + (i < signal.score ? 'bg-blue-400' : 'bg-white/8')} />
+          {[...Array(maxScore)].map((_, i) => (
+            <div key={i} className={[
+              'h-1.5 flex-1 rounded-full',
+              i < signal.score ? (
+                signal.score >= 9 ? 'bg-emerald-400' :
+                signal.score >= 7 ? 'bg-blue-400' :
+                'bg-blue-400/60'
+              ) : 'bg-white/8',
+            ].join(' ')} />
           ))}
         </div>
-        <span className="text-blue-400 text-xs font-bold">{signal.score}/8</span>
+        <span className={`text-xs font-bold ${scoreColor}`}>
+          {signal.score}/{maxScore}
+        </span>
       </div>
 
+      {/* WIN/LOSS pip result */}
       {signal.status === 'WIN' && (
         <div className="mt-2 flex items-center justify-center gap-2 bg-green-500/10 border border-green-500/20 rounded-lg py-1.5">
           <CheckCircle size={12} className="text-green-400" />
@@ -126,22 +166,37 @@ export function SignalCard({ signal }: Props) {
         </div>
       )}
 
+      {/* Expanded score breakdown */}
       {isSelected && (
         <div className="mt-3 pt-3 border-t border-white/6">
-          <p className="text-gray-500 text-xs mb-2">Score breakdown</p>
+          <p className="text-gray-500 text-xs mb-2 font-medium">Score breakdown — {signal.score}/{maxScore}</p>
           <div className="grid grid-cols-2 gap-1.5">
             {Object.entries(SCORE_LABELS).map(([key, label]) => {
-              const pts = signal.score_breakdown?.[key] ?? 0
+              const pts     = signal.score_breakdown?.[key] ?? 0
+              const maxPts  = key === 'trend_structure'  ? 2
+                            : key === 'swing_proximity'  ? 2
+                            : key === 'liquidity_sweep'  ? 2
+                            : key === 'macd'             ? 2
+                            : 1
               return (
-                <div key={key} className={'flex items-center gap-1.5 text-xs rounded-lg px-2 py-1.5 ' + (pts > 0 ? 'bg-green-500/10 text-green-400 border border-green-500/20' : 'bg-white/3 text-gray-600 border border-white/5')}>
+                <div key={key} className={[
+                  'flex items-center gap-1.5 text-xs rounded-lg px-2 py-1.5',
+                  pts > 0
+                    ? 'bg-green-500/10 text-green-400 border border-green-500/20'
+                    : 'bg-white/3 text-gray-600 border border-white/5',
+                ].join(' ')}>
                   <span>{pts > 0 ? '✓' : '–'}</span>
-                  <span>{label}</span>
-                  {pts > 0 && <span className="ml-auto font-bold">+{pts}</span>}
+                  <span className="truncate">{label}</span>
+                  {pts > 0 && (
+                    <span className="ml-auto font-bold shrink-0">+{pts}</span>
+                  )}
                 </div>
               )
             })}
           </div>
-          <p className="text-blue-400/60 text-xs mt-2.5 text-center">Tap again to view chart ↓</p>
+          <p className="text-blue-400/50 text-xs mt-2.5 text-center">
+            Tap again to view chart ↓
+          </p>
         </div>
       )}
     </div>
