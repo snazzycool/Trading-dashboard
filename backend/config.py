@@ -1,5 +1,5 @@
 """
-config.py — Trading Signal Bot v2 configuration.
+config.py — Trading Signal Bot v2.1 configuration.
 
 SCAN SCHEDULE (free tier calculation):
   London:   07:00-16:00 UTC = 9h = 36 scans/day
@@ -8,13 +8,13 @@ SCAN SCHEDULE (free tier calculation):
   Total unique scans/day:   56 scans
   Credits: 6 pairs x 2 TF x 56 = 672/day (limit: 800) OK
 
-SCORING MODEL v2 (max 10 points, min 6 to trade):
-  +2  Market structure trend  (HH/HL or LH/LL)
-  +1  RSI confirmation        (above/below midline)
-  +2  Swing level proximity   (price near key level)
-  +1  ATR volatility          (market is moving)
-  +2  Liquidity sweep + ORB   (smart money signal)
-  +2  MACD momentum           (momentum confirms direction)
+SCORING MODEL v2.1 (max 10 points, min 6 to trade):
+  +2  Trend structure (HH/HL or LH/LL) — or +1 if EMA fallback used
+  +1  RSI confirmation (correct side of midline)
+  +2  Swing level proximity (price near key level)
+  +1  ATR volatility (market is moving)
+  +2  Liquidity sweep + ORB (smart money signal)
+  +2  MACD momentum (confirms direction)
 """
 import os
 from dotenv import load_dotenv
@@ -32,19 +32,18 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH: str = os.path.join(_DATA_DIR, "signals.db")
 
 # ── Watchlist ─────────────────────────────────────────────────────────────
-# USD/CAD and EUR/JPY removed — replaced with cleaner pairs
 WATCHLIST: list[str] = [
     "EUR/USD",   # Most liquid forex — benchmark pair
     "GBP/USD",   # Strong trends, clean structure
     "GBP/JPY",   # Volatile, excellent pip range
     "AUD/USD",   # Commodity-linked, reliable structure
-    "XAU/USD",   # Gold — best performer historically
-    "NZD/USD",   # Replaces USD/CAD — cleaner technical moves
+    "XAU/USD",   # Gold — best performer
+    "NZD/USD",   # Replaces USD/CAD — cleaner moves
 ]
 
 ENTRY_INTERVAL: str = "15min"
 HTF_INTERVAL:   str = "1h"
-BARS_REQUIRED:  int = 300    # extra bars needed for MACD warm-up
+BARS_REQUIRED:  int = 300
 
 # ── Scan schedule ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_SECONDS: int = 900           # every 15 minutes
@@ -59,26 +58,31 @@ ACTIVE_SESSION_HOURS: list[tuple[int, int]] = [
 # Opening range: minutes after session open used for ORB detection
 ORB_MINUTES: int = 15
 
-# ── Scoring model v2 (max 10) ─────────────────────────────────────────────
+# ── Scoring model v2.1 (max 10) ───────────────────────────────────────────
 MIN_SCORE_TO_TRADE: int = 6
 
-SCORE_TREND_STRUCTURE: int = 2  # HH/HL (uptrend) or LH/LL (downtrend)
-SCORE_RSI:             int = 1  # RSI on correct side of midline
-SCORE_SWING_PROXIMITY: int = 2  # price near significant swing level
-SCORE_ATR_VOLATILITY:  int = 1  # ATR above its rolling average
-SCORE_LIQUIDITY_SWEEP: int = 2  # liquidity sweep / ORB reversal
-SCORE_MACD:            int = 2  # MACD line + histogram momentum
+SCORE_TREND_STRUCTURE: int = 2  # full if structure, partial (+1) if EMA fallback
+SCORE_RSI:             int = 1
+SCORE_SWING_PROXIMITY: int = 2
+SCORE_ATR_VOLATILITY:  int = 1
+SCORE_LIQUIDITY_SWEEP: int = 2
+SCORE_MACD:            int = 2
 
 # ── Indicators ────────────────────────────────────────────────────────────
+
+# EMA — used as fallback trend filter when structure is unclear
+EMA_FAST: int = 50
+EMA_SLOW: int = 200
+
 # Trend structure detection
-TREND_LOOKBACK: int = 5    # number of swing points to confirm trend
+TREND_LOOKBACK: int = 5
 
-# RSI — widened to just "correct side of midline"
+# RSI
 RSI_PERIOD:          int   = 14
-RSI_BUY_THRESHOLD:   float = 55.0   # BUY: RSI < 55
-RSI_SELL_THRESHOLD:  float = 45.0   # SELL: RSI > 45
+RSI_BUY_THRESHOLD:   float = 55.0
+RSI_SELL_THRESHOLD:  float = 45.0
 
-# ATR (stable rolling method)
+# ATR
 ATR_PERIOD:     int = 14
 ATR_AVG_PERIOD: int = 50
 
@@ -87,24 +91,22 @@ MACD_FAST:   int = 12
 MACD_SLOW:   int = 26
 MACD_SIGNAL: int = 9
 
-# Swing level proximity
+# Swing levels
 SWING_LOOKBACK:      int   = 30
-SWING_PROXIMITY_PCT: float = 0.003  # 0.3% for forex pairs
-GOLD_PROXIMITY_PCT:  float = 0.008  # 0.8% for XAU/USD
+SWING_PROXIMITY_PCT: float = 0.003
+GOLD_PROXIMITY_PCT:  float = 0.008
 
-# Liquidity sweep window
+# Liquidity sweep
 LIQUIDITY_SWEEP_BARS: int = 5
 
-# Candle confirmation — last N candles must close in signal direction
+# Candle confirmation
 CANDLE_CONFIRM_COUNT: int = 2
 
 # ── Risk management ───────────────────────────────────────────────────────
-# SL/TP based on market structure; ATR used as fallback + buffer
 ATR_SL_MULTIPLIER: float = 1.5
 ATR_TP_MULTIPLIER: float = 2.5
-ATR_BUFFER:        float = 0.3   # push SL slightly beyond swing level
+ATR_BUFFER:        float = 0.3
 
-# Minimum SL distance (prevents spread noise killing trades)
 MIN_SL_PIPS_FOREX: float = 15.0
 MIN_SL_PIPS_JPY:   float = 20.0
 MIN_SL_PIPS_GOLD:  float = 150.0

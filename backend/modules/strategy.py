@@ -1,15 +1,13 @@
 """
-modules/strategy.py — Signal scoring engine v2.
+modules/strategy.py — Signal scoring engine v2.1
 
-New in v2:
-  - Market structure trend detection (HH/HL / LH/LL) replaces EMA cross
-  - MACD momentum confirmation (new +2 score component)
-  - ORB (Opening Range Breakout) integrated into liquidity sweep scoring
-  - Widened RSI (BUY<55, SELL>45 instead of <40/>60)
-  - Candle direction confirmation before firing
-  - Minimum pip distance on SL (prevents spread stopouts)
-  - Stable rolling ATR with 5% sanity check
-  - Market structure SL/TP with ATR fallback
+Trend detection — Hybrid approach (Option B):
+  1. Try strict market structure first (3 confirmed swing points)
+     - Higher quality signal — gets full +2 score
+  2. If market is choppy/ranging, fall back to EMA 50/200 cross
+     - Secondary confirmation — gets +1 score (partial credit)
+  This ensures the bot never goes completely silent during ranging
+  markets while still prioritising structure signals when available.
 """
 import logging
 from dataclasses import dataclass, field
@@ -57,21 +55,15 @@ def _compute_atr(
 
 
 def _is_kill_zone() -> bool:
-    """Return True if current UTC time is inside London or New York session."""
     hour = datetime.now(timezone.utc).hour
     return any(s <= hour < e for s, e in config.ACTIVE_SESSION_HOURS)
 
 
 def _is_orb_window() -> bool:
-    """
-    Return True if we are within ORB_MINUTES of a session open.
-    London opens 07:00 UTC, New York opens 12:00 UTC.
-    """
     now  = datetime.now(timezone.utc)
     hour = now.hour
     mins = now.minute
-    opens = [7, 12]
-    for o in opens:
+    for o in [7, 12]:
         if hour == o and mins < config.ORB_MINUTES:
             return True
     return False
@@ -107,12 +99,15 @@ class _Card:
 # ── Indicator computation ─────────────────────────────────────────────────
 
 def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Add RSI, ATR, MACD to the DataFrame."""
     try:
         df = df.copy()
         c  = df["close"]
         h  = df["high"]
         l  = df["low"]
+
+        # EMA (used as fallback trend filter)
+        df["ema_fast"] = c.ewm(span=config.EMA_FAST, adjust=False).mean()
+        df["ema_slow"] = c.ewm(span=config.EMA_SLOW, adjust=False).mean()
 
         # RSI
         delta = c.diff()
@@ -130,11 +125,11 @@ def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         ).mean()
 
         # MACD
-        ema_fast   = c.ewm(span=config.MACD_FAST,   adjust=False).mean()
-        ema_slow   = c.ewm(span=config.MACD_SLOW,   adjust=False).mean()
-        macd_line  = ema_fast - ema_slow
+        ema_fast    = c.ewm(span=config.MACD_FAST,   adjust=False).mean()
+        ema_slow    = c.ewm(span=config.MACD_SLOW,   adjust=False).mean()
+        macd_line   = ema_fast - ema_slow
         signal_line = macd_line.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
-        df["macd"]       = macd_line
+        df["macd"]        = macd_line
         df["macd_signal"] = signal_line
         df["macd_hist"]   = macd_line - signal_line
 
@@ -144,34 +139,31 @@ def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
 
 
-# ── Trend structure detection (replaces EMA cross) ────────────────────────
+# ── Hybrid trend detection ─────────────────────────────────────────────────
 
-def _detect_trend(df: pd.DataFrame) -> str:
+def _detect_structure_trend(df: pd.DataFrame) -> str:
     """
-    Detect trend direction from market structure:
-      Uptrend   = series of Higher Highs AND Higher Lows
-      Downtrend = series of Lower  Lows  AND Lower  Highs
-      Ranging   = neither pattern confirmed
+    Primary trend detection via market structure (HH/HL or LH/LL).
+    Requires 3 confirmed swing points in sequence.
+    Returns 'BUY', 'SELL', or 'NEUTRAL'.
     """
     if len(df) < 50:
         return "NEUTRAL"
 
+    n      = len(df)
+    lb     = min(config.SWING_LOOKBACK * 2, n - 4)
     highs  = df["high"].values
     lows   = df["low"].values
-    n      = len(highs)
-    lb     = min(config.SWING_LOOKBACK * 2, n - 4)
-    recent = slice(n - lb, n)
 
     sh, sl = [], []
     for i in range(n - lb + 2, n - 2):
-        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and \
-           highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+        if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
             sh.append(highs[i])
-        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and \
-           lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+        if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
             sl.append(lows[i])
 
-    # Need at least 3 swing points to confirm a pattern
     sh = sh[-config.TREND_LOOKBACK:]
     sl = sl[-config.TREND_LOOKBACK:]
 
@@ -189,23 +181,64 @@ def _detect_trend(df: pd.DataFrame) -> str:
     return "NEUTRAL"
 
 
-# ── Candle confirmation ───────────────────────────────────────────────────
+def _detect_ema_trend(df: pd.DataFrame) -> str:
+    """
+    Fallback trend detection via EMA 50/200 cross.
+    Used when market structure is unclear/ranging.
+    Returns 'BUY', 'SELL', or 'NEUTRAL'.
+    """
+    last = df.iloc[-1]
+    ef   = last.get("ema_fast")
+    es   = last.get("ema_slow")
+    if pd.isna(ef) or pd.isna(es):
+        return "NEUTRAL"
+    if ef > es:
+        return "BUY"
+    if ef < es:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _detect_trend_hybrid(
+    df: pd.DataFrame,
+) -> Tuple[str, bool]:
+    """
+    Hybrid trend detection:
+      1. Try market structure first (strict, 3 swing points)
+      2. Fall back to EMA 50/200 if structure is NEUTRAL
+    Returns (direction, is_structure_based).
+    is_structure_based=True  → full +2 trend score
+    is_structure_based=False → partial +1 trend score (EMA fallback)
+    """
+    structure = _detect_structure_trend(df)
+    if structure != "NEUTRAL":
+        logger.debug("Trend: structure confirmed (%s)", structure)
+        return structure, True
+
+    ema = _detect_ema_trend(df)
+    if ema != "NEUTRAL":
+        logger.debug("Trend: EMA fallback used (%s)", ema)
+        return ema, False
+
+    return "NEUTRAL", False
+
+
+# ── Candle confirmation ────────────────────────────────────────────────────
 
 def _confirm_candle_direction(df: pd.DataFrame, direction: str) -> bool:
-    """
-    Last CANDLE_CONFIRM_COUNT closed candles must close in signal direction.
-    Prevents entering mid-reversal before price commits.
-    """
     n = config.CANDLE_CONFIRM_COUNT
     if len(df) < n + 1:
         return False
-    recent = df.iloc[-(n+1):-1]  # exclude current forming candle
+    recent = df.iloc[-(n+1):-1]
     if direction == "BUY":
-        return all(recent["close"].iloc[i] > recent["open"].iloc[i]
-                   for i in range(len(recent)))
-    else:
-        return all(recent["close"].iloc[i] < recent["open"].iloc[i]
-                   for i in range(len(recent)))
+        return all(
+            recent["close"].iloc[i] > recent["open"].iloc[i]
+            for i in range(len(recent))
+        )
+    return all(
+        recent["close"].iloc[i] < recent["open"].iloc[i]
+        for i in range(len(recent))
+    )
 
 
 # ── Scoring components ────────────────────────────────────────────────────
@@ -229,8 +262,8 @@ def _score_swing_proximity(
 ) -> int:
     lb     = min(config.SWING_LOOKBACK, len(df) - 1)
     recent = df.iloc[-(lb + 1):-1]
-    level  = float(recent["low"].min()) if direction == "BUY" \
-             else float(recent["high"].max())
+    level  = (float(recent["low"].min()) if direction == "BUY"
+              else float(recent["high"].max()))
     if abs(close - level) / close <= proximity_pct:
         return config.SCORE_SWING_PROXIMITY
     return 0
@@ -246,11 +279,6 @@ def _score_atr(df: pd.DataFrame) -> int:
 
 
 def _score_sweep_and_orb(df: pd.DataFrame, direction: str) -> int:
-    """
-    Score up to +2:
-    - Liquidity sweep: price broke beyond a swing level then reversed
-    - ORB bonus: if we are in the opening range window, a sweep scores max
-    """
     lb = min(config.LIQUIDITY_SWEEP_BARS + config.SWING_LOOKBACK, len(df) - 2)
     if lb < 4:
         return 0
@@ -276,47 +304,38 @@ def _score_sweep_and_orb(df: pd.DataFrame, direction: str) -> int:
     if not swept:
         return 0
 
-    # During kill zone opening range — sweep gets full bonus
     if _is_orb_window():
-        logger.debug("ORB sweep detected — full bonus awarded")
-        return config.SCORE_LIQUIDITY_SWEEP
-
+        logger.debug("ORB sweep detected — full bonus")
     return config.SCORE_LIQUIDITY_SWEEP
 
 
 def _score_macd(df: pd.DataFrame, direction: str) -> int:
     """
     +2 if MACD confirms direction:
-    - MACD line must be on correct side of signal line
-    - Histogram must be growing (momentum increasing, not fading)
-    Both conditions must be true.
+    - Line on correct side of signal line
+    - Histogram growing in signal direction
     """
     if len(df) < 3:
         return 0
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    macd       = last.get("macd",       np.nan)
-    sig        = last.get("macd_signal", np.nan)
-    hist       = last.get("macd_hist",   np.nan)
-    prev_hist  = prev.get("macd_hist",   np.nan)
+    last      = df.iloc[-1]
+    prev      = df.iloc[-2]
+    macd      = last.get("macd",        np.nan)
+    sig       = last.get("macd_signal", np.nan)
+    hist      = last.get("macd_hist",   np.nan)
+    prev_hist = prev.get("macd_hist",   np.nan)
 
     if any(pd.isna(v) for v in [macd, sig, hist, prev_hist]):
         return 0
 
     if direction == "BUY":
-        # MACD above signal AND histogram growing upward
-        cross_ok = macd > sig
+        cross_ok         = macd > sig
         momentum_growing = hist > prev_hist and hist > 0
     else:
-        # MACD below signal AND histogram growing downward
-        cross_ok = macd < sig
+        cross_ok         = macd < sig
         momentum_growing = hist < prev_hist and hist < 0
 
-    if cross_ok and momentum_growing:
-        return config.SCORE_MACD
-    return 0
+    return config.SCORE_MACD if (cross_ok and momentum_growing) else 0
 
 
 # ── Market structure SL/TP ────────────────────────────────────────────────
@@ -325,7 +344,6 @@ def _find_structure_levels(
     df: pd.DataFrame,
     direction: str,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Find swing-based SL and TP levels."""
     if len(df) < 40:
         return None, None
 
@@ -336,23 +354,23 @@ def _find_structure_levels(
 
     sh, sl = [], []
     for i in range(2, n - 2):
-        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and \
-           highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+        if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
             sh.append(highs[i])
-        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and \
-           lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+        if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
             sl.append(lows[i])
 
     close = float(df["close"].iloc[-1])
 
     if direction == "BUY":
-        below = [l for l in sl if l < close]
-        above = [h for h in sh if h > close]
+        below    = [l for l in sl if l < close]
+        above    = [h for h in sh if h > close]
         sl_level = max(below) if below else None
         tp_level = min(above) if above else None
     else:
-        above = [h for h in sh if h > close]
-        below = [l for l in sl if l < close]
+        above    = [h for h in sh if h > close]
+        below    = [l for l in sl if l < close]
         sl_level = min(above) if above else None
         tp_level = max(below) if below else None
 
@@ -366,21 +384,13 @@ def _compute_sl_tp(
     atr: float,
     pair: str,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Compute SL and TP with validation:
-    1. Try market structure levels first
-    2. Fall back to ATR multiples if structure not found
-    3. Apply ATR buffer to SL
-    4. Enforce minimum pip distance on SL
-    5. Validate minimum RR
-    """
     pip      = _pip_value(pair)
     min_pips = _min_sl_pips(pair)
 
     sl_raw, tp_raw = _find_structure_levels(df, direction)
 
     if sl_raw is None or tp_raw is None:
-        logger.debug("%s: no clear structure — using ATR levels", pair)
+        logger.debug("%s: no structure levels — using ATR fallback", pair)
         if direction == "BUY":
             sl_raw = close - atr * config.ATR_SL_MULTIPLIER
             tp_raw = close + atr * config.ATR_TP_MULTIPLIER
@@ -388,22 +398,17 @@ def _compute_sl_tp(
             sl_raw = close + atr * config.ATR_SL_MULTIPLIER
             tp_raw = close - atr * config.ATR_TP_MULTIPLIER
 
-    # Apply ATR buffer beyond the structure level
-    if direction == "BUY":
-        sl = sl_raw - atr * config.ATR_BUFFER
-        tp = tp_raw
-    else:
-        sl = sl_raw + atr * config.ATR_BUFFER
-        tp = tp_raw
+    # ATR buffer beyond structure level
+    sl = sl_raw - atr * config.ATR_BUFFER if direction == "BUY" \
+         else sl_raw + atr * config.ATR_BUFFER
+    tp = tp_raw
 
-    # Enforce minimum SL distance in pips
+    # Enforce minimum pip distance
     sl_pips = abs(close - sl) / pip
     if sl_pips < min_pips:
-        logger.debug("%s: SL too tight (%.1f pips < %.1f min) — widening", pair, sl_pips, min_pips)
-        if direction == "BUY":
-            sl = close - (min_pips * pip)
-        else:
-            sl = close + (min_pips * pip)
+        logger.debug("%s: SL too tight (%.1f pips) — widening to %.1f", pair, sl_pips, min_pips)
+        sl = (close - min_pips * pip) if direction == "BUY" \
+             else (close + min_pips * pip)
 
     risk   = abs(close - sl)
     reward = abs(tp - close)
@@ -411,9 +416,8 @@ def _compute_sl_tp(
     if reward <= 0 or risk <= 0:
         return None, None
 
-    rr = reward / risk
-    if rr < config.MIN_RISK_REWARD:
-        logger.debug("%s: RR %.2f below minimum %.2f", pair, rr, config.MIN_RISK_REWARD)
+    if reward / risk < config.MIN_RISK_REWARD:
+        logger.debug("%s: RR %.2f below minimum", pair, reward / risk)
         return None, None
 
     return sl, tp
@@ -426,15 +430,6 @@ def evaluate_pair(
     df_entry: pd.DataFrame,
     df_htf:   pd.DataFrame,
 ) -> Optional[SignalResult]:
-    """
-    Full v2 signal evaluation pipeline:
-    1. Add indicators to both timeframes
-    2. Detect trend from market structure (HTF + entry TF must agree)
-    3. Candle direction confirmation
-    4. Score all 5 components
-    5. Compute market-structure SL/TP
-    6. Validate RR and minimum score
-    """
     try:
         df_entry = _add_indicators(df_entry)
         df_htf   = _add_indicators(df_htf)
@@ -450,24 +445,22 @@ def evaluate_pair(
 
         if np.isnan(atr) or atr <= 0:
             return None
-
-        # Sanity check: ATR must be < 5% of price
         if atr > close * 0.05:
-            logger.warning("%s: ATR %.5f > 5%% of price — data corrupted, skipping", pair, atr)
+            logger.warning("%s: ATR sanity check failed — skipping", pair)
             return None
 
-        # ── Trend detection (both TFs must agree) ─────────────────────────
-        htf_trend   = _detect_trend(df_htf)
-        entry_trend = _detect_trend(df_entry)
+        # ── Hybrid trend detection (both TFs must agree) ───────────────────
+        htf_dir,   htf_structure   = _detect_trend_hybrid(df_htf)
+        entry_dir, entry_structure = _detect_trend_hybrid(df_entry)
 
-        if htf_trend == "NEUTRAL" or entry_trend == "NEUTRAL":
-            logger.debug("%s: no clear trend on one or both TFs", pair)
+        if htf_dir == "NEUTRAL" or entry_dir == "NEUTRAL":
+            logger.debug("%s: no trend on one or both TFs", pair)
             return None
-        if htf_trend != entry_trend:
-            logger.debug("%s: TF conflict HTF=%s entry=%s", pair, htf_trend, entry_trend)
+        if htf_dir != entry_dir:
+            logger.debug("%s: TF conflict HTF=%s entry=%s", pair, htf_dir, entry_dir)
             return None
 
-        direction = htf_trend
+        direction = htf_dir
 
         # ── Candle confirmation ────────────────────────────────────────────
         if not _confirm_candle_direction(df_entry, direction):
@@ -479,16 +472,28 @@ def evaluate_pair(
         proximity_pct = config.GOLD_PROXIMITY_PCT if is_gold else config.SWING_PROXIMITY_PCT
 
         card = _Card()
-        card.add("trend_structure",  config.SCORE_TREND_STRUCTURE)  # already confirmed
-        card.add("rsi",              _score_rsi(df_entry, direction))
-        card.add("swing_proximity",  _score_swing_proximity(df_entry, close, direction, proximity_pct))
-        card.add("atr_volatility",   _score_atr(df_entry))
-        card.add("liquidity_sweep",  _score_sweep_and_orb(df_entry, direction))
-        card.add("macd",             _score_macd(df_entry, direction))
 
-        logger.info("%s %s | Score %d/10 | %s",
-                    pair, direction, card.total,
-                    {k: v for k, v in card.breakdown.items() if v > 0})
+        # Trend score: +2 if structure confirmed, +1 if EMA fallback used
+        # Both TFs being structure-based = full +2
+        # Either TF using EMA fallback = partial +1
+        if htf_structure and entry_structure:
+            card.add("trend_structure", config.SCORE_TREND_STRUCTURE)       # +2
+        else:
+            card.add("trend_structure", config.SCORE_TREND_STRUCTURE - 1)   # +1
+
+        card.add("rsi",             _score_rsi(df_entry, direction))
+        card.add("swing_proximity", _score_swing_proximity(df_entry, close, direction, proximity_pct))
+        card.add("atr_volatility",  _score_atr(df_entry))
+        card.add("liquidity_sweep", _score_sweep_and_orb(df_entry, direction))
+        card.add("macd",            _score_macd(df_entry, direction))
+
+        logger.info(
+            "%s %s | Score %d/10 | structure=%s/%s | %s",
+            pair, direction, card.total,
+            "S" if htf_structure else "E",
+            "S" if entry_structure else "E",
+            {k: v for k, v in card.breakdown.items() if v > 0},
+        )
 
         if card.total < config.MIN_SCORE_TO_TRADE:
             logger.debug("%s: score %d below threshold %d",
@@ -498,7 +503,6 @@ def evaluate_pair(
         # ── SL/TP ─────────────────────────────────────────────────────────
         sl, tp = _compute_sl_tp(df_entry, direction, close, atr, pair)
         if sl is None or tp is None:
-            logger.debug("%s: invalid SL/TP — signal rejected", pair)
             return None
 
         risk   = abs(close - sl)
@@ -508,8 +512,7 @@ def evaluate_pair(
         pip        = _pip_value(pair)
         pip_risk   = round(risk   / pip, 1)
         pip_reward = round(reward / pip, 1)
-
-        decimals = 2 if is_gold else (3 if "JPY" in pair else 5)
+        decimals   = 2 if is_gold else (3 if "JPY" in pair else 5)
 
         return SignalResult(
             pair=pair,
@@ -531,10 +534,10 @@ def evaluate_pair(
 
 
 def check_outcome(
-    direction: str,
-    entry: float,
-    stop_loss: float,
-    take_profit: float,
+    direction:     str,
+    entry:         float,
+    stop_loss:     float,
+    take_profit:   float,
     current_price: float,
 ) -> Optional[str]:
     if direction == "BUY":
