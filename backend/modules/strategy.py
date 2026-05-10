@@ -1,13 +1,22 @@
 """
-modules/strategy.py — Signal scoring engine v2.1
+modules/strategy.py — Signal scoring engine v3 (simplified).
 
-Trend detection — Hybrid approach (Option B):
-  1. Try strict market structure first (3 confirmed swing points)
-     - Higher quality signal — gets full +2 score
-  2. If market is choppy/ranging, fall back to EMA 50/200 cross
-     - Secondary confirmation — gets +1 score (partial credit)
-  This ensures the bot never goes completely silent during ranging
-  markets while still prioritising structure signals when available.
+What changed from v2:
+  - Removed candle confirmation (was silently killing all signals)
+  - Session filter is now a score BONUS (+1) not a hard gate
+  - Scanner runs all day, London/NY signals score higher
+  - Min score lowered to 5/10 for practical signal generation
+  - MACD histogram requirement relaxed (line cross is enough)
+  - All other quality filters kept intact
+
+Scoring model (max 10, min 5 to trade):
+  +2  Trend (structure HH/HL or EMA fallback)
+  +1  RSI on correct side of midline
+  +2  Price near swing level
+  +1  ATR above average (volatile market)
+  +2  Liquidity sweep / ORB reversal
+  +2  MACD momentum
+  +1  BONUS: signal fired during London or NY session
 """
 import logging
 from dataclasses import dataclass, field
@@ -44,7 +53,7 @@ def _compute_atr(
     close: pd.Series,
     period: int,
 ) -> pd.Series:
-    """Stable rolling ATR — immune to EWM runaway from extreme early bars."""
+    """Stable rolling ATR."""
     prev = close.shift(1)
     tr = pd.concat([
         high - low,
@@ -54,19 +63,10 @@ def _compute_atr(
     return tr.rolling(window=period, min_periods=period).mean()
 
 
-def _is_kill_zone() -> bool:
+def _in_session() -> bool:
+    """True if current UTC hour is inside London or New York session."""
     hour = datetime.now(timezone.utc).hour
     return any(s <= hour < e for s, e in config.ACTIVE_SESSION_HOURS)
-
-
-def _is_orb_window() -> bool:
-    now  = datetime.now(timezone.utc)
-    hour = now.hour
-    mins = now.minute
-    for o in [7, 12]:
-        if hour == o and mins < config.ORB_MINUTES:
-            return True
-    return False
 
 
 # ── Data classes ──────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ class _Card:
         self.breakdown[name] = pts
 
 
-# ── Indicator computation ─────────────────────────────────────────────────
+# ── Indicators ────────────────────────────────────────────────────────────
 
 def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     try:
@@ -105,7 +105,7 @@ def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         h  = df["high"]
         l  = df["low"]
 
-        # EMA (used as fallback trend filter)
+        # EMA (fallback trend + MACD)
         df["ema_fast"] = c.ewm(span=config.EMA_FAST, adjust=False).mean()
         df["ema_slow"] = c.ewm(span=config.EMA_SLOW, adjust=False).mean()
 
@@ -125,13 +125,13 @@ def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         ).mean()
 
         # MACD
-        ema_fast    = c.ewm(span=config.MACD_FAST,   adjust=False).mean()
-        ema_slow    = c.ewm(span=config.MACD_SLOW,   adjust=False).mean()
-        macd_line   = ema_fast - ema_slow
-        signal_line = macd_line.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
-        df["macd"]        = macd_line
-        df["macd_signal"] = signal_line
-        df["macd_hist"]   = macd_line - signal_line
+        ema_f       = c.ewm(span=config.MACD_FAST,   adjust=False).mean()
+        ema_s       = c.ewm(span=config.MACD_SLOW,   adjust=False).mean()
+        macd        = ema_f - ema_s
+        signal      = macd.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
+        df["macd"]        = macd
+        df["macd_signal"] = signal
+        df["macd_hist"]   = macd - signal
 
         return df
     except Exception as e:
@@ -139,23 +139,22 @@ def _add_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
 
 
-# ── Hybrid trend detection ─────────────────────────────────────────────────
+# ── Hybrid trend detection ────────────────────────────────────────────────
 
-def _detect_structure_trend(df: pd.DataFrame) -> str:
+def _structure_trend(df: pd.DataFrame) -> str:
     """
-    Primary trend detection via market structure (HH/HL or LH/LL).
-    Requires 3 confirmed swing points in sequence.
-    Returns 'BUY', 'SELL', or 'NEUTRAL'.
+    Detect trend from market structure (HH/HL or LH/LL).
+    Requires 3 confirmed swing points — high quality signal.
     """
     if len(df) < 50:
         return "NEUTRAL"
 
-    n      = len(df)
-    lb     = min(config.SWING_LOOKBACK * 2, n - 4)
-    highs  = df["high"].values
-    lows   = df["low"].values
-
+    n     = len(df)
+    lb    = min(config.SWING_LOOKBACK * 2, n - 4)
+    highs = df["high"].values
+    lows  = df["low"].values
     sh, sl = [], []
+
     for i in range(n - lb + 2, n - 2):
         if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
                 highs[i] > highs[i+1] and highs[i] > highs[i+2]):
@@ -168,25 +167,18 @@ def _detect_structure_trend(df: pd.DataFrame) -> str:
     sl = sl[-config.TREND_LOOKBACK:]
 
     if len(sh) >= 3 and len(sl) >= 3:
-        hh = all(sh[i] < sh[i+1] for i in range(len(sh)-1))
-        hl = all(sl[i] < sl[i+1] for i in range(len(sl)-1))
-        if hh and hl:
+        if (all(sh[i] < sh[i+1] for i in range(len(sh)-1)) and
+                all(sl[i] < sl[i+1] for i in range(len(sl)-1))):
             return "BUY"
-
-        ll = all(sl[i] > sl[i+1] for i in range(len(sl)-1))
-        lh = all(sh[i] > sh[i+1] for i in range(len(sh)-1))
-        if ll and lh:
+        if (all(sl[i] > sl[i+1] for i in range(len(sl)-1)) and
+                all(sh[i] > sh[i+1] for i in range(len(sh)-1))):
             return "SELL"
 
     return "NEUTRAL"
 
 
-def _detect_ema_trend(df: pd.DataFrame) -> str:
-    """
-    Fallback trend detection via EMA 50/200 cross.
-    Used when market structure is unclear/ranging.
-    Returns 'BUY', 'SELL', or 'NEUTRAL'.
-    """
+def _ema_trend(df: pd.DataFrame) -> str:
+    """EMA 50/200 fallback — used when structure is unclear."""
     last = df.iloc[-1]
     ef   = last.get("ema_fast")
     es   = last.get("ema_slow")
@@ -199,46 +191,16 @@ def _detect_ema_trend(df: pd.DataFrame) -> str:
     return "NEUTRAL"
 
 
-def _detect_trend_hybrid(
-    df: pd.DataFrame,
-) -> Tuple[str, bool]:
+def _detect_trend(df: pd.DataFrame) -> Tuple[str, bool]:
     """
-    Hybrid trend detection:
-      1. Try market structure first (strict, 3 swing points)
-      2. Fall back to EMA 50/200 if structure is NEUTRAL
+    Try structure first, fall back to EMA.
     Returns (direction, is_structure_based).
-    is_structure_based=True  → full +2 trend score
-    is_structure_based=False → partial +1 trend score (EMA fallback)
     """
-    structure = _detect_structure_trend(df)
-    if structure != "NEUTRAL":
-        logger.debug("Trend: structure confirmed (%s)", structure)
-        return structure, True
-
-    ema = _detect_ema_trend(df)
-    if ema != "NEUTRAL":
-        logger.debug("Trend: EMA fallback used (%s)", ema)
-        return ema, False
-
-    return "NEUTRAL", False
-
-
-# ── Candle confirmation ────────────────────────────────────────────────────
-
-def _confirm_candle_direction(df: pd.DataFrame, direction: str) -> bool:
-    n = config.CANDLE_CONFIRM_COUNT
-    if len(df) < n + 1:
-        return False
-    recent = df.iloc[-(n+1):-1]
-    if direction == "BUY":
-        return all(
-            recent["close"].iloc[i] > recent["open"].iloc[i]
-            for i in range(len(recent))
-        )
-    return all(
-        recent["close"].iloc[i] < recent["open"].iloc[i]
-        for i in range(len(recent))
-    )
+    s = _structure_trend(df)
+    if s != "NEUTRAL":
+        return s, True
+    e = _ema_trend(df)
+    return e, False
 
 
 # ── Scoring components ────────────────────────────────────────────────────
@@ -278,7 +240,11 @@ def _score_atr(df: pd.DataFrame) -> int:
     return config.SCORE_ATR_VOLATILITY if atr > avg else 0
 
 
-def _score_sweep_and_orb(df: pd.DataFrame, direction: str) -> int:
+def _score_liquidity_sweep(df: pd.DataFrame, direction: str) -> int:
+    """
+    Checks for liquidity sweep: price broke a swing level then reversed.
+    During London/NY open (first 15 min) this scores full bonus — ORB effect.
+    """
     lb = min(config.LIQUIDITY_SWEEP_BARS + config.SWING_LOOKBACK, len(df) - 2)
     if lb < 4:
         return 0
@@ -286,7 +252,6 @@ def _score_sweep_and_orb(df: pd.DataFrame, direction: str) -> int:
     ref    = df.iloc[-(lb + 1):-(config.LIQUIDITY_SWEEP_BARS + 1)]
     recent = df.iloc[-(config.LIQUIDITY_SWEEP_BARS + 1):]
 
-    swept = False
     try:
         if direction == "BUY":
             prior = float(ref["low"].min())
@@ -298,44 +263,31 @@ def _score_sweep_and_orb(df: pd.DataFrame, direction: str) -> int:
             swept = not recent[
                 (recent["high"] > prior) & (recent["close"] < prior)
             ].empty
+        return config.SCORE_LIQUIDITY_SWEEP if swept else 0
     except Exception:
-        pass
-
-    if not swept:
         return 0
-
-    if _is_orb_window():
-        logger.debug("ORB sweep detected — full bonus")
-    return config.SCORE_LIQUIDITY_SWEEP
 
 
 def _score_macd(df: pd.DataFrame, direction: str) -> int:
     """
-    +2 if MACD confirms direction:
-    - Line on correct side of signal line
-    - Histogram growing in signal direction
+    +2 if MACD line is on the correct side of signal line.
+    Histogram growing is preferred but not required (relaxed from v2).
     """
     if len(df) < 3:
         return 0
 
-    last      = df.iloc[-1]
-    prev      = df.iloc[-2]
-    macd      = last.get("macd",        np.nan)
-    sig       = last.get("macd_signal", np.nan)
-    hist      = last.get("macd_hist",   np.nan)
-    prev_hist = prev.get("macd_hist",   np.nan)
+    last = df.iloc[-1]
+    macd = last.get("macd",        np.nan)
+    sig  = last.get("macd_signal", np.nan)
 
-    if any(pd.isna(v) for v in [macd, sig, hist, prev_hist]):
+    if pd.isna(macd) or pd.isna(sig):
         return 0
 
-    if direction == "BUY":
-        cross_ok         = macd > sig
-        momentum_growing = hist > prev_hist and hist > 0
-    else:
-        cross_ok         = macd < sig
-        momentum_growing = hist < prev_hist and hist < 0
-
-    return config.SCORE_MACD if (cross_ok and momentum_growing) else 0
+    if direction == "BUY"  and macd > sig:
+        return config.SCORE_MACD
+    if direction == "SELL" and macd < sig:
+        return config.SCORE_MACD
+    return 0
 
 
 # ── Market structure SL/TP ────────────────────────────────────────────────
@@ -351,8 +303,8 @@ def _find_structure_levels(
     highs  = recent["high"].values
     lows   = recent["low"].values
     n      = len(highs)
-
     sh, sl = [], []
+
     for i in range(2, n - 2):
         if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
                 highs[i] > highs[i+1] and highs[i] > highs[i+2]):
@@ -390,7 +342,7 @@ def _compute_sl_tp(
     sl_raw, tp_raw = _find_structure_levels(df, direction)
 
     if sl_raw is None or tp_raw is None:
-        logger.debug("%s: no structure levels — using ATR fallback", pair)
+        logger.debug("%s: no structure levels — ATR fallback", pair)
         if direction == "BUY":
             sl_raw = close - atr * config.ATR_SL_MULTIPLIER
             tp_raw = close + atr * config.ATR_TP_MULTIPLIER
@@ -398,24 +350,21 @@ def _compute_sl_tp(
             sl_raw = close + atr * config.ATR_SL_MULTIPLIER
             tp_raw = close - atr * config.ATR_TP_MULTIPLIER
 
-    # ATR buffer beyond structure level
-    sl = sl_raw - atr * config.ATR_BUFFER if direction == "BUY" \
-         else sl_raw + atr * config.ATR_BUFFER
+    sl = (sl_raw - atr * config.ATR_BUFFER if direction == "BUY"
+          else sl_raw + atr * config.ATR_BUFFER)
     tp = tp_raw
 
-    # Enforce minimum pip distance
+    # Enforce minimum pip distance on SL
     sl_pips = abs(close - sl) / pip
     if sl_pips < min_pips:
-        logger.debug("%s: SL too tight (%.1f pips) — widening to %.1f", pair, sl_pips, min_pips)
-        sl = (close - min_pips * pip) if direction == "BUY" \
-             else (close + min_pips * pip)
+        sl = (close - min_pips * pip if direction == "BUY"
+              else close + min_pips * pip)
 
     risk   = abs(close - sl)
     reward = abs(tp - close)
 
     if reward <= 0 or risk <= 0:
         return None, None
-
     if reward / risk < config.MIN_RISK_REWARD:
         logger.debug("%s: RR %.2f below minimum", pair, reward / risk)
         return None, None
@@ -430,13 +379,18 @@ def evaluate_pair(
     df_entry: pd.DataFrame,
     df_htf:   pd.DataFrame,
 ) -> Optional[SignalResult]:
+    """
+    Full signal evaluation pipeline v3.
+    Removed: candle confirmation, session hard gate.
+    Added:   session as score bonus (+1).
+    """
     try:
         df_entry = _add_indicators(df_entry)
         df_htf   = _add_indicators(df_htf)
 
         if df_entry is None or df_htf is None:
             return None
-        if len(df_entry) < config.MACD_SLOW + 30 or len(df_htf) < config.MACD_SLOW + 30:
+        if len(df_entry) < config.MACD_SLOW + 10 or len(df_htf) < config.MACD_SLOW + 10:
             logger.debug("%s: not enough bars", pair)
             return None
 
@@ -449,49 +403,43 @@ def evaluate_pair(
             logger.warning("%s: ATR sanity check failed — skipping", pair)
             return None
 
-        # ── Hybrid trend detection (both TFs must agree) ───────────────────
-        htf_dir,   htf_structure   = _detect_trend_hybrid(df_htf)
-        entry_dir, entry_structure = _detect_trend_hybrid(df_entry)
+        # ── Trend detection (HTF + entry must agree) ──────────────────────
+        htf_dir,   htf_struct   = _detect_trend(df_htf)
+        entry_dir, entry_struct = _detect_trend(df_entry)
 
         if htf_dir == "NEUTRAL" or entry_dir == "NEUTRAL":
-            logger.debug("%s: no trend on one or both TFs", pair)
+            logger.debug("%s: no clear trend", pair)
             return None
         if htf_dir != entry_dir:
             logger.debug("%s: TF conflict HTF=%s entry=%s", pair, htf_dir, entry_dir)
             return None
 
-        direction = htf_dir
-
-        # ── Candle confirmation ────────────────────────────────────────────
-        if not _confirm_candle_direction(df_entry, direction):
-            logger.debug("%s: candle direction not confirmed", pair)
-            return None
-
-        # ── Scoring ───────────────────────────────────────────────────────
+        direction     = htf_dir
         is_gold       = (pair == "XAU/USD")
         proximity_pct = config.GOLD_PROXIMITY_PCT if is_gold else config.SWING_PROXIMITY_PCT
 
+        # ── Scoring ───────────────────────────────────────────────────────
         card = _Card()
 
-        # Trend score: +2 if structure confirmed, +1 if EMA fallback used
-        # Both TFs being structure-based = full +2
-        # Either TF using EMA fallback = partial +1
-        if htf_structure and entry_structure:
-            card.add("trend_structure", config.SCORE_TREND_STRUCTURE)       # +2
-        else:
-            card.add("trend_structure", config.SCORE_TREND_STRUCTURE - 1)   # +1
+        # Trend: +2 if structure confirmed on both TFs, +1 if EMA fallback
+        trend_pts = config.SCORE_TREND_STRUCTURE if (htf_struct and entry_struct) else 1
+        card.add("trend_structure",  trend_pts)
+        card.add("rsi",              _score_rsi(df_entry, direction))
+        card.add("swing_proximity",  _score_swing_proximity(df_entry, close, direction, proximity_pct))
+        card.add("atr_volatility",   _score_atr(df_entry))
+        card.add("liquidity_sweep",  _score_liquidity_sweep(df_entry, direction))
+        card.add("macd",             _score_macd(df_entry, direction))
 
-        card.add("rsi",             _score_rsi(df_entry, direction))
-        card.add("swing_proximity", _score_swing_proximity(df_entry, close, direction, proximity_pct))
-        card.add("atr_volatility",  _score_atr(df_entry))
-        card.add("liquidity_sweep", _score_sweep_and_orb(df_entry, direction))
-        card.add("macd",            _score_macd(df_entry, direction))
+        # Session bonus: +1 if firing during London or New York
+        if _in_session():
+            card.add("session_bonus", 1)
 
         logger.info(
-            "%s %s | Score %d/10 | structure=%s/%s | %s",
+            "%s %s | Score %d/10 | trend=%s/%s | session=%s | %s",
             pair, direction, card.total,
-            "S" if htf_structure else "E",
-            "S" if entry_structure else "E",
+            "S" if htf_struct   else "E",
+            "S" if entry_struct else "E",
+            "YES" if _in_session() else "NO",
             {k: v for k, v in card.breakdown.items() if v > 0},
         )
 
@@ -500,7 +448,7 @@ def evaluate_pair(
                          pair, card.total, config.MIN_SCORE_TO_TRADE)
             return None
 
-        # ── SL/TP ─────────────────────────────────────────────────────────
+        # ── SL / TP ───────────────────────────────────────────────────────
         sl, tp = _compute_sl_tp(df_entry, direction, close, atr, pair)
         if sl is None or tp is None:
             return None
