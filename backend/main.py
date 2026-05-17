@@ -1,6 +1,5 @@
 """
-main.py — FastAPI application entry point.
-Serves REST API + WebSocket endpoint for real-time signal streaming.
+main.py — FastAPI application with Capital.com automation.
 """
 import logging
 import json
@@ -15,24 +14,44 @@ from fastapi.responses import FileResponse
 import config
 from modules import database as db
 from modules import scanner
+from modules.capital_client import capital
+from modules.trade_executor import sync_open_positions
 
-# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ── App lifecycle ─────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────────────────
     db.init_db()
+
+    # Connect to Capital.com
+    if config.CAPITAL_API_KEY and config.CAPITAL_IDENTIFIER:
+        connected = capital.login()
+        if connected:
+            logger.info("Capital.com connected (%s)", config.CAPITAL_ENV.upper())
+            await sync_open_positions()
+        else:
+            logger.warning(
+                "Capital.com login failed — signals will work but no auto-trading"
+            )
+    else:
+        logger.warning("Capital.com credentials not set — running in signal-only mode")
+
     scanner.start_scheduler()
-    logger.info("Trading dashboard backend started")
+    logger.info("Trading bot started")
+
     yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────
     scanner.stop_scheduler()
-    logger.info("Backend stopped")
+    capital.logout()
+    logger.info("Trading bot stopped")
+
 
 app = FastAPI(title="Trading Signal Dashboard", lifespan=lifespan)
 
@@ -42,6 +61,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -56,22 +76,27 @@ async def websocket_endpoint(ws: WebSocket):
     logger.info("WebSocket client connected")
 
     try:
-        # Send current scanner state immediately on connect
-        active = db.get_state("scanner_active", "off") == "on"
+        # Send full state on connect
+        account_info = scanner.get_account_cache() or {}
+        positions    = capital.get_open_positions() if capital.is_connected() else []
+
         await ws.send_text(json.dumps({
             "event": "init",
             "data": {
-                "scanner_active": active,
-                "signals": [_ser(s) for s in db.get_all_signals(50)],
-                "stats": db.get_performance_stats(),
-            }
+                "scanner_active": db.get_state("scanner_active", "off") == "on",
+                "signals":        [db.serialize(s) for s in db.get_all_signals(50)],
+                "stats":          db.get_performance_stats(),
+                "account":        account_info,
+                "positions":      positions,
+                "auto_trade":     config.AUTO_TRADE,
+                "capital_env":    config.CAPITAL_ENV.upper(),
+                "capital_connected": capital.is_connected(),
+            },
         }))
 
-        # Listen for control messages from browser
         async for raw in ws.iter_text():
             try:
-                msg = json.loads(raw)
-                await _handle_ws_message(msg, ws)
+                await _handle_ws(json.loads(raw), ws)
             except json.JSONDecodeError:
                 pass
 
@@ -80,56 +105,80 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         scanner.unregister_client(send)
 
-async def _handle_ws_message(msg: dict, ws: WebSocket):
+
+async def _handle_ws(msg: dict, ws: WebSocket):
     action = msg.get("action")
+
     if action == "start_scanner":
         db.set_state("scanner_active", "on")
         await ws.send_text(json.dumps({
             "event": "scanner_toggled", "data": {"active": True}
         }))
-        logger.info("Scanner enabled via WebSocket")
 
     elif action == "stop_scanner":
         db.set_state("scanner_active", "off")
         await ws.send_text(json.dumps({
             "event": "scanner_toggled", "data": {"active": False}
         }))
-        logger.info("Scanner disabled via WebSocket")
 
     elif action == "get_stats":
         await ws.send_text(json.dumps({
-            "event": "stats_update",
-            "data": db.get_performance_stats()
+            "event": "stats_update", "data": db.get_performance_stats()
         }))
 
-    elif action == "get_signals":
-        limit = msg.get("limit", 100)
+    elif action == "get_account":
+        info = capital.get_account_info() if capital.is_connected() else {}
         await ws.send_text(json.dumps({
-            "event": "signals_list",
-            "data": [_ser(s) for s in db.get_all_signals(limit)]
+            "event": "account_update", "data": info or {}
         }))
+
+    elif action == "get_positions":
+        positions = capital.get_open_positions() if capital.is_connected() else []
+        await ws.send_text(json.dumps({
+            "event": "positions_update", "data": positions
+        }))
+
 
 # ── REST endpoints ────────────────────────────────────────────────────────
 
 @app.get("/api/signals")
 def get_signals(limit: int = 100):
-    return [_ser(s) for s in db.get_all_signals(limit)]
+    return [db.serialize(s) for s in db.get_all_signals(limit)]
 
 @app.get("/api/signals/{signal_id}")
 def get_signal(signal_id: int):
     sig = db.get_signal_by_id(signal_id)
     if not sig:
         raise HTTPException(status_code=404, detail="Signal not found")
-    return _ser(sig)
+    return db.serialize(sig)
 
 @app.get("/api/stats")
 def get_stats():
     return db.get_performance_stats()
 
+@app.get("/api/account")
+def get_account():
+    if not capital.is_connected():
+        return {"error": "Capital.com not connected", "connected": False}
+    info = capital.get_account_info()
+    if not info:
+        return {"error": "Failed to fetch account", "connected": True}
+    return {**info, "connected": True, "environment": config.CAPITAL_ENV.upper()}
+
+@app.get("/api/positions")
+def get_positions():
+    if not capital.is_connected():
+        return []
+    return capital.get_open_positions()
+
 @app.get("/api/scanner/status")
 def scanner_status():
-    active = db.get_state("scanner_active", "off") == "on"
-    return {"active": active}
+    return {
+        "active":            db.get_state("scanner_active", "off") == "on",
+        "capital_connected": capital.is_connected(),
+        "auto_trade":        config.AUTO_TRADE,
+        "environment":       config.CAPITAL_ENV.upper(),
+    }
 
 @app.post("/api/scanner/start")
 def start_scanner():
@@ -141,30 +190,18 @@ def stop_scanner():
     db.set_state("scanner_active", "off")
     return {"active": False}
 
-# ── Serve React frontend (production) ─────────────────────────────────────
+
+# ── Serve React frontend ──────────────────────────────────────────────────
 
 _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "dist")
 
 if os.path.isdir(_FRONTEND_DIST):
-    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")),
+        name="assets",
+    )
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
-        index = os.path.join(_FRONTEND_DIST, "index.html")
-        return FileResponse(index)
-
-# ── Helper ────────────────────────────────────────────────────────────────
-
-def _ser(row: dict) -> dict:
-    import json as _json
-    try:
-        row["score_breakdown"] = _json.loads(row.get("score_breakdown") or "{}")
-    except Exception:
-        row["score_breakdown"] = {}
-    return row
-
-# ── Dev entrypoint ─────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        return FileResponse(os.path.join(_FRONTEND_DIST, "index.html"))

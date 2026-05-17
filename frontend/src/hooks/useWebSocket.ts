@@ -6,12 +6,15 @@ const WS_URL = import.meta.env.VITE_WS_URL ||
   `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
 
 export function useWebSocket() {
-  const ws = useRef<WebSocket | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>()
+  const ws              = useRef<WebSocket | null>(null)
+  const reconnectTimer  = useRef<ReturnType<typeof setTimeout>>()
 
   const {
     setConnected, setScannerActive, setScannerStatus,
     setSignals, addSignal, updateSignal, setStats,
+    setAccount, setPositions,
+    setCapitalConnected, setCapitalEnv, setAutoTrade,
+    addNotification,
   } = useStore()
 
   const connect = useCallback(() => {
@@ -35,13 +38,21 @@ export function useWebSocket() {
             setScannerActive(data.scanner_active)
             setSignals(data.signals || [])
             if (data.stats) setStats(data.stats)
+            if (data.account) setAccount(data.account)
+            if (data.positions) setPositions(data.positions)
+            setCapitalConnected(data.capital_connected ?? false)
+            setCapitalEnv(data.capital_env ?? 'DEMO')
+            setAutoTrade(data.auto_trade ?? true)
             setScannerStatus({ message: 'Ready', scanning: false })
             break
 
           case 'new_signal':
             addSignal(data)
-            // Also refresh stats
             send({ action: 'get_stats' })
+            addNotification(
+              `New signal: ${data.pair} ${data.direction} (${data.score}/8)`,
+              'info'
+            )
             break
 
           case 'signal_update':
@@ -66,6 +77,38 @@ export function useWebSocket() {
 
           case 'stats_update':
             setStats(data)
+            break
+
+          case 'account_update':
+            setAccount({
+              balance:     data.balance,
+              profit_loss: data.profit_loss,
+              available:   data.available,
+              currency:    data.currency,
+            })
+            setPositions(data.positions || [])
+            break
+
+          case 'trade_opened':
+            addNotification(
+              `🔵 Trade opened: ${data.pair} ${data.direction}`,
+              'trade'
+            )
+            send({ action: 'get_positions' })
+            break
+
+          case 'trade_closed':
+            if (data.outcome === 'WIN') {
+              addNotification(`✅ WIN: ${data.pair} ${data.direction}`, 'win')
+            } else {
+              addNotification(`❌ LOSS: ${data.pair} ${data.direction}`, 'loss')
+            }
+            send({ action: 'get_stats' })
+            send({ action: 'get_positions' })
+            break
+
+          case 'positions_update':
+            setPositions(data || [])
             break
         }
       } catch { /* ignore malformed */ }

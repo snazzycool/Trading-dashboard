@@ -1,43 +1,37 @@
 // src/App.tsx
 import { useEffect, useState, useCallback } from 'react'
-import { Activity, Play, Square, Wifi, WifiOff, BarChart2, Clock, List, TrendingUp, TrendingDown, Bell, BellOff, ChevronUp } from 'lucide-react'
+import { Activity, Play, Square, Wifi, WifiOff, BarChart2, Clock, List, TrendingUp, TrendingDown, Bell, BellOff, ChevronUp, X, DollarSign } from 'lucide-react'
 import { useStore } from './store/useStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useNotifications } from './hooks/useNotifications'
 import { SignalCard } from './components/signals/SignalCard'
 import { SignalDetail } from './components/signals/SignalDetail'
 import { StatsPanel } from './components/signals/StatsPanel'
+import { AccountPanel } from './components/trading/AccountPanel'
 
 export default function App() {
-  const { connected, scannerActive, scannerStatus, signals, stats, selectedSignalId, activeTab, setActiveTab } = useStore()
+  const { connected, scannerActive, scannerStatus, signals, stats, selectedSignalId, activeTab, setActiveTab, account, capitalConnected, capitalEnv, notifications, removeNotification } = useStore()
   const { startScanner, stopScanner } = useWebSocket()
   const { requestPermission, sendNotification, isSupported, isGranted } = useNotifications()
-
   const [notifEnabled, setNotifEnabled] = useState(isGranted)
   const [showScrollTop, setShowScrollTop] = useState(false)
 
-  const selectedSignal  = signals.find(s => s.id === selectedSignalId)
-  const pendingCount    = signals.filter(s => s.status === 'PENDING').length
-  const winCount        = signals.filter(s => s.status === 'WIN').length
-  const lossCount       = signals.filter(s => s.status === 'LOSS').length
-  const liveSignals     = signals.filter(s => s.status === 'PENDING')
-  const historySignals  = signals.filter(s => s.status !== 'PENDING')
+  const selectedSignal = signals.find(s => s.id === selectedSignalId)
+  const pendingCount   = signals.filter(s => s.status === 'PENDING').length
+  const winCount       = signals.filter(s => s.status === 'WIN').length
+  const lossCount      = signals.filter(s => s.status === 'LOSS').length
+  const liveSignals    = signals.filter(s => s.status === 'PENDING')
+  const historySignals = signals.filter(s => s.status !== 'PENDING')
 
-  // Notify on new signal
   useEffect(() => {
     if (!notifEnabled || signals.length === 0) return
     const newest = signals[0]
     if (newest.status !== 'PENDING') return
     const age = Date.now() - new Date(newest.created_at + 'Z').getTime()
     if (age > 60000) return
-    sendNotification(
-      `${newest.direction} \u2014 ${newest.pair}`,
-      `Score ${newest.score}/8 \u00b7 Entry ${newest.entry} \u00b7 RR 1:${newest.risk_reward}`,
-      `signal-${newest.id}`
-    )
+    sendNotification(`${newest.direction} \u2014 ${newest.pair}`, `Score ${newest.score}/8 \u00b7 RR 1:${newest.risk_reward}`, `signal-${newest.id}`)
   }, [signals[0]?.id])
 
-  // Notify on WIN/LOSS
   useEffect(() => {
     if (!notifEnabled) return
     const recent = signals.find(s => s.status === 'WIN' || s.status === 'LOSS')
@@ -45,18 +39,14 @@ export default function App() {
     const age = Date.now() - new Date(recent.resolved_at + 'Z').getTime()
     if (age > 120000) return
     const pips = recent.status === 'WIN' ? `+${recent.pip_reward}` : `-${recent.pip_risk}`
-    sendNotification(
-      `${recent.status === 'WIN' ? '\u2705' : '\u274c'} ${recent.status} \u2014 ${recent.pair}`,
-      `${recent.direction} closed ${recent.status} \u00b7 ${pips} pips`,
-      `result-${recent.id}`
-    )
+    sendNotification(`${recent.status === 'WIN' ? '\u2705' : '\u274c'} ${recent.status} \u2014 ${recent.pair}`, `${recent.direction} \u00b7 ${pips} pips`, `result-${recent.id}`)
   }, [signals.find(s => s.status !== 'PENDING')?.id])
 
   const handleNotifToggle = useCallback(async () => {
     if (!notifEnabled) {
       const granted = await requestPermission()
       setNotifEnabled(granted)
-      if (granted) sendNotification('Notifications enabled \u2705', 'You will be alerted on new signals and results')
+      if (granted) sendNotification('Notifications enabled \u2705', 'You will be alerted on new signals')
     } else {
       setNotifEnabled(false)
     }
@@ -68,10 +58,12 @@ export default function App() {
     return () => window.removeEventListener('scroll', fn)
   }, [])
 
+  const pnl      = account?.profit_loss ?? 0
+  const pnlColor = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400'
+
   return (
     <div className="min-h-screen bg-[#08080f] flex flex-col text-white">
 
-      {/* Header */}
       <header className="bg-[#0d0d1a] border-b border-white/5 sticky top-0 z-30">
         <div className="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
 
@@ -80,23 +72,34 @@ export default function App() {
               <Activity size={15} className="text-white" />
             </div>
             <div className="hidden sm:block">
-              <p className="text-white font-bold text-sm leading-none">Signal Dashboard</p>
-              <p className="text-gray-500 text-xs mt-0.5">Algorithmic Trading</p>
+              <p className="text-white font-bold text-sm leading-none">Signal Bot</p>
+              <p className="text-gray-500 text-xs mt-0.5">
+                {capitalConnected
+                  ? <span className={capitalEnv === 'DEMO' ? 'text-yellow-500' : 'text-green-400'}>{capitalEnv} Mode</span>
+                  : <span className="text-gray-600">Signal Only</span>}
+              </p>
             </div>
           </div>
 
           <div className="hidden md:flex items-center gap-2">
             {[
               { icon: Clock,        val: pendingCount, label: 'Live',   col: 'text-yellow-400', bg: 'bg-yellow-400/10 border-yellow-500/20' },
-              { icon: TrendingUp,   val: winCount,     label: 'Wins',   col: 'text-green-400',  bg: 'bg-green-400/10  border-green-500/20' },
-              { icon: TrendingDown, val: lossCount,    label: 'Losses', col: 'text-red-400',    bg: 'bg-red-400/10    border-red-500/20' },
+              { icon: TrendingUp,   val: winCount,     label: 'Wins',   col: 'text-green-400',  bg: 'bg-green-400/10  border-green-500/20'  },
+              { icon: TrendingDown, val: lossCount,    label: 'Losses', col: 'text-red-400',    bg: 'bg-red-400/10    border-red-500/20'    },
             ].map(({ icon: Icon, val, label, col, bg }) => (
               <div key={label} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium ${bg} ${col}`}>
                 <Icon size={11} /><span className="font-bold">{val}</span><span className="opacity-70">{label}</span>
               </div>
             ))}
-            {stats && stats.total > 0 && (
+            {capitalConnected && account && (
               <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium bg-blue-400/10 border-blue-500/20 text-blue-400">
+                <DollarSign size={11} />
+                <span className="font-bold">{account.currency} {account.balance.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                {pnl !== 0 && <span className={pnlColor}>({pnl >= 0 ? '+' : ''}{pnl.toFixed(2)})</span>}
+              </div>
+            )}
+            {stats && stats.total > 0 && (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium bg-purple-400/10 border-purple-500/20 text-purple-400">
                 <BarChart2 size={11} /><span className="font-bold">{stats.win_rate}%</span><span className="opacity-70">Win</span>
               </div>
             )}
@@ -104,23 +107,17 @@ export default function App() {
 
           <div className="flex items-center gap-2 shrink-0">
             {isSupported && (
-              <button
-                onClick={handleNotifToggle}
-                title={notifEnabled ? 'Disable notifications' : 'Enable notifications'}
-                className={`p-2 rounded-lg border transition-all ${notifEnabled ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' : 'bg-white/5 border-white/10 text-gray-500 hover:text-gray-300'}`}
-              >
+              <button onClick={handleNotifToggle}
+                className={`p-2 rounded-lg border transition-all ${notifEnabled ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' : 'bg-white/5 border-white/10 text-gray-500 hover:text-gray-300'}`}>
                 {notifEnabled ? <Bell size={15} /> : <BellOff size={15} />}
               </button>
             )}
-            <button
-              onClick={scannerActive ? stopScanner : startScanner}
-              disabled={!connected}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-40 ${
+            <button onClick={scannerActive ? stopScanner : startScanner} disabled={!connected}
+              className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-40 ${
                 scannerActive
                   ? 'bg-red-500/15 text-red-400 border border-red-500/30 hover:bg-red-500/25'
                   : 'bg-green-500/15 text-green-400 border border-green-500/30 hover:bg-green-500/25'
-              }`}
-            >
+              }`}>
               {scannerActive ? <><Square size={12} className="fill-current" />Stop</> : <><Play size={12} className="fill-current" />Start</>}
             </button>
             <div className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border ${connected ? 'bg-green-400/10 border-green-500/20 text-green-400' : 'bg-red-400/10 border-red-500/20 text-red-400'}`}>
@@ -131,35 +128,44 @@ export default function App() {
         </div>
 
         {(scannerActive || scannerStatus.scanning) && (
-          <div className="border-t border-white/5 bg-blue-500/5 px-4 py-1.5 flex items-center gap-2 max-w-7xl mx-auto">
+          <div className="border-t border-white/5 bg-blue-500/5 px-4 py-1.5 flex items-center gap-2">
             {scannerStatus.scanning && (
               <div className="flex gap-0.5">
                 {[0,1,2].map(i => <div key={i} className="w-1 h-3 bg-blue-400 rounded-full animate-bounce opacity-70" style={{ animationDelay: `${i*150}ms` }} />)}
               </div>
             )}
             <p className="text-blue-300/60 text-xs">{scannerStatus.message}</p>
-            {scannerStatus.last_scan && (
-              <p className="text-gray-600 text-xs ml-auto">{new Date(scannerStatus.last_scan + 'Z').toLocaleTimeString()}</p>
-            )}
+            {scannerStatus.last_scan && <p className="text-gray-600 text-xs ml-auto">{new Date(scannerStatus.last_scan + 'Z').toLocaleTimeString()}</p>}
           </div>
         )}
       </header>
 
-      {/* Body */}
+      {/* Toast notifications */}
+      <div className="fixed top-16 right-4 z-50 flex flex-col gap-2 max-w-xs w-full">
+        {notifications.map(n => (
+          <div key={n.id} className={`flex items-start gap-3 px-4 py-3 rounded-xl border shadow-xl text-sm font-medium ${
+            n.type === 'win'   ? 'bg-green-900/80 border-green-500/30 text-green-300' :
+            n.type === 'loss'  ? 'bg-red-900/80   border-red-500/30   text-red-300'   :
+            n.type === 'trade' ? 'bg-blue-900/80  border-blue-500/30  text-blue-300'  :
+                                 'bg-gray-800/90  border-white/10     text-gray-200'
+          }`}>
+            <p className="flex-1 leading-snug">{n.message}</p>
+            <button onClick={() => removeNotification(n.id)} className="opacity-50 hover:opacity-100"><X size={13} /></button>
+          </div>
+        ))}
+      </div>
+
       <div className="flex-1 max-w-7xl mx-auto w-full px-4 py-5 flex flex-col lg:flex-row gap-5">
 
         {/* Left: signal list */}
         <div className="w-full lg:w-[380px] flex flex-col gap-3 shrink-0">
           <div className="flex bg-white/4 border border-white/8 rounded-xl p-1 gap-1">
             {([
-              { key: 'feed' as const,    label: 'Live Feed', icon: Activity, count: pendingCount },
+              { key: 'feed'    as const, label: 'Live Feed', icon: Activity, count: pendingCount },
               { key: 'history' as const, label: 'History',   icon: List,     count: historySignals.length },
             ]).map(({ key, label, icon: Icon, count }) => (
-              <button
-                key={key}
-                onClick={() => setActiveTab(key)}
-                className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === key ? 'bg-white/10 text-white' : 'text-gray-500 hover:text-gray-300'}`}
-              >
+              <button key={key} onClick={() => setActiveTab(key)}
+                className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === key ? 'bg-white/10 text-white' : 'text-gray-500 hover:text-gray-300'}`}>
                 <Icon size={14} />{label}
                 {count > 0 && (
                   <span className={`text-xs rounded-full px-1.5 py-0.5 font-bold ${activeTab === key ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-400'}`}>{count}</span>
@@ -176,25 +182,27 @@ export default function App() {
             )}
             {activeTab === 'history' && (
               historySignals.length === 0
-                ? <div className="flex flex-col items-center py-16 text-center"><List size={32} className="text-white/10 mb-3" /><p className="text-gray-500 text-sm">No resolved signals yet</p></div>
+                ? <div className="flex flex-col items-center py-16"><List size={32} className="text-white/10 mb-3" /><p className="text-gray-500 text-sm">No resolved signals yet</p></div>
                 : historySignals.map(s => <SignalCard key={s.id} signal={s} />)
             )}
           </div>
         </div>
 
-        {/* Right: detail + stats */}
+        {/* Right: detail + account + performance */}
         <div className="flex-1 flex flex-col gap-5 min-w-0">
           {selectedSignal ? (
             <SignalDetail signal={selectedSignal} />
           ) : (
-            <div className="bg-white/2 border border-white/5 border-dashed rounded-2xl flex flex-col items-center justify-center py-16 text-center min-h-[280px]">
-              <div className="w-14 h-14 rounded-2xl bg-white/5 flex items-center justify-center mb-4">
-                <BarChart2 size={24} className="text-white/15" />
+            <div className="bg-white/2 border border-white/5 border-dashed rounded-2xl flex flex-col items-center justify-center py-12 text-center min-h-[180px]">
+              <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center mb-3">
+                <BarChart2 size={22} className="text-white/15" />
               </div>
               <p className="text-gray-400 font-medium">Select a signal to view chart</p>
-              <p className="text-gray-600 text-sm mt-1.5 max-w-xs leading-relaxed">Click any signal card to see its TradingView chart, entry/SL/TP and score breakdown</p>
+              <p className="text-gray-600 text-sm mt-1 max-w-xs leading-relaxed">Click any signal card to see its TradingView chart and score breakdown</p>
             </div>
           )}
+
+          <AccountPanel />
 
           <div className="bg-[#0d0d1a] border border-white/6 rounded-2xl p-5">
             <div className="flex items-center gap-2 mb-5">
@@ -202,9 +210,7 @@ export default function App() {
                 <BarChart2 size={13} className="text-blue-400" />
               </div>
               <h2 className="text-white font-semibold">Performance</h2>
-              {stats && stats.total > 0 && (
-                <span className="ml-auto text-xs text-gray-600">{stats.total} signal{stats.total !== 1 ? 's' : ''}</span>
-              )}
+              {stats && stats.total > 0 && <span className="ml-auto text-xs text-gray-600">{stats.total} signals</span>}
             </div>
             <StatsPanel />
           </div>
@@ -212,10 +218,8 @@ export default function App() {
       </div>
 
       {showScrollTop && (
-        <button
-          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-          className="fixed bottom-6 right-6 w-10 h-10 bg-blue-600 hover:bg-blue-500 rounded-xl flex items-center justify-center shadow-xl shadow-blue-500/25 transition-all z-50"
-        >
+        <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+          className="fixed bottom-6 right-6 w-10 h-10 bg-blue-600 hover:bg-blue-500 rounded-xl flex items-center justify-center shadow-xl shadow-blue-500/25 transition-all z-50">
           <ChevronUp size={18} />
         </button>
       )}
