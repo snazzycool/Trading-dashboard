@@ -18,25 +18,24 @@ const STATUS_ICON: Record<string, any> = {
   EXPIRED: AlertCircle,
 }
 
-// v2 score labels (6 components, max 10)
+// V1 score labels (5 components, max 8)
 const SCORE_LABELS: Record<string, string> = {
-  trend_structure:  'Trend Structure',
-  rsi:              'RSI',
-  swing_proximity:  'Swing Level',
-  atr_volatility:   'Volatility',
-  liquidity_sweep:  'Sweep/ORB',
-  macd:             'MACD',
+  trend_confirmation: 'Trend (EMA)',
+  rsi_pullback:       'RSI Pullback',
+  market_structure:   'Market Structure',
+  atr_volatility:     'Volatility (ATR)',
+  liquidity_sweep:    'Liquidity Sweep',
 }
 
 export function SignalCard({ signal }: Props) {
   const { setSelectedSignalId, selectedSignalId } = useStore()
-  const isSelected  = selectedSignalId === signal.id
-  const StatusIcon  = STATUS_ICON[signal.status] ?? Clock
-  const maxScore    = 10  // v2 scoring out of 10
+  const isSelected = selectedSignalId === signal.id
+  const StatusIcon = STATUS_ICON[signal.status] ?? Clock
+  const maxScore   = 8   // V1 scores out of 8
 
   const fmt = (p: number) =>
-    signal.pair === 'XAU/USD'        ? p.toFixed(2)
-    : signal.pair.includes('JPY')    ? p.toFixed(3)
+    signal.pair === 'XAU/USD'     ? p.toFixed(2)
+    : signal.pair.includes('JPY') ? p.toFixed(3)
     : p.toFixed(5)
 
   const timeStr = new Date(signal.created_at + 'Z').toLocaleTimeString([], {
@@ -49,11 +48,25 @@ export function SignalCard({ signal }: Props) {
   const pipRisk   = signal.pip_risk   ?? 0
   const pipReward = signal.pip_reward ?? 0
 
-  // Score colour based on quality
   const scoreColor =
-    signal.score >= 9 ? 'text-emerald-400' :
-    signal.score >= 7 ? 'text-blue-400'    :
+    signal.score >= 7 ? 'text-emerald-400' :
+    signal.score >= 6 ? 'text-blue-400'    :
+    signal.score >= 5 ? 'text-yellow-400'  :
     'text-gray-400'
+
+  // Check if this is an old v2 signal (has v2 keys)
+  const breakdown     = signal.score_breakdown ?? {}
+  const hasV1Keys     = Object.keys(breakdown).some(k => k in SCORE_LABELS)
+  const displayLabels = hasV1Keys ? SCORE_LABELS : {
+    trend_structure:  'Trend Structure',
+    rsi:              'RSI',
+    swing_proximity:  'Swing Level',
+    atr_volatility:   'Volatility',
+    liquidity_sweep:  'Sweep/ORB',
+    macd:             'MACD',
+    session_bonus:    'Session Bonus',
+  }
+  const displayMax = hasV1Keys ? 8 : 10
 
   return (
     <div
@@ -83,6 +96,11 @@ export function SignalCard({ signal }: Props) {
             ].join(' ')}>
               {signal.direction}
             </span>
+            {signal.deal_id && (
+              <span className="ml-1.5 text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                AUTO
+              </span>
+            )}
           </div>
         </div>
 
@@ -91,8 +109,7 @@ export function SignalCard({ signal }: Props) {
             'flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border',
             STATUS_STYLE[signal.status],
           ].join(' ')}>
-            <StatusIcon size={10} />
-            {signal.status}
+            <StatusIcon size={10} />{signal.status}
           </span>
           <span className="text-gray-600 text-xs">{dateStr} {timeStr}</span>
         </div>
@@ -132,23 +149,23 @@ export function SignalCard({ signal }: Props) {
         </div>
       )}
 
-      {/* Score bar — out of 10 */}
+      {/* Score bar */}
       <div className="flex items-center gap-2">
         <span className="text-gray-600 text-xs">Score</span>
         <div className="flex gap-0.5 flex-1">
-          {[...Array(maxScore)].map((_, i) => (
+          {[...Array(displayMax)].map((_, i) => (
             <div key={i} className={[
               'h-1.5 flex-1 rounded-full',
-              i < signal.score ? (
-                signal.score >= 9 ? 'bg-emerald-400' :
-                signal.score >= 7 ? 'bg-blue-400' :
-                'bg-blue-400/60'
-              ) : 'bg-white/8',
+              i < signal.score
+                ? signal.score >= 7 ? 'bg-emerald-400'
+                  : signal.score >= 6 ? 'bg-blue-400'
+                  : 'bg-yellow-400'
+                : 'bg-white/8',
             ].join(' ')} />
           ))}
         </div>
         <span className={`text-xs font-bold ${scoreColor}`}>
-          {signal.score}/{maxScore}
+          {signal.score}/{displayMax}
         </span>
       </div>
 
@@ -166,18 +183,15 @@ export function SignalCard({ signal }: Props) {
         </div>
       )}
 
-      {/* Expanded score breakdown */}
+      {/* Score breakdown (expanded) */}
       {isSelected && (
         <div className="mt-3 pt-3 border-t border-white/6">
-          <p className="text-gray-500 text-xs mb-2 font-medium">Score breakdown — {signal.score}/{maxScore}</p>
+          <p className="text-gray-500 text-xs mb-2 font-medium">
+            Score breakdown — {signal.score}/{displayMax}
+          </p>
           <div className="grid grid-cols-2 gap-1.5">
-            {Object.entries(SCORE_LABELS).map(([key, label]) => {
-              const pts     = signal.score_breakdown?.[key] ?? 0
-              const maxPts  = key === 'trend_structure'  ? 2
-                            : key === 'swing_proximity'  ? 2
-                            : key === 'liquidity_sweep'  ? 2
-                            : key === 'macd'             ? 2
-                            : 1
+            {Object.entries(displayLabels).map(([key, label]) => {
+              const pts = breakdown[key] ?? 0
               return (
                 <div key={key} className={[
                   'flex items-center gap-1.5 text-xs rounded-lg px-2 py-1.5',
@@ -187,9 +201,7 @@ export function SignalCard({ signal }: Props) {
                 ].join(' ')}>
                   <span>{pts > 0 ? '✓' : '–'}</span>
                   <span className="truncate">{label}</span>
-                  {pts > 0 && (
-                    <span className="ml-auto font-bold shrink-0">+{pts}</span>
-                  )}
+                  {pts > 0 && <span className="ml-auto font-bold shrink-0">+{pts}</span>}
                 </div>
               )
             })}
