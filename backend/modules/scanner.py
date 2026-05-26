@@ -103,16 +103,40 @@ async def scan_markets():
         })
         return
 
-    logger.info("Scan started — %d pairs", len(config.WATCHLIST))
+    # Session-aware scanning - prioritize active trading sessions
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+
+    # Determine session priority
+    in_london = 7 <= hour < 16
+    in_ny = 12 <= hour < 21
+    in_overlap = in_london and in_ny  # 12-16 UTC
+    in_off_hours = not in_london and not in_ny
+
+    session_name = (
+        "London+NY Overlap" if in_overlap else
+        "London Session" if in_london else
+        "New York Session" if in_ny else
+        "Off-Hours (limited scan)"
+    )
+
+    # During off-hours, scan less frequently (only high-priority pairs)
+    pairs_to_scan = config.WATCHLIST
+    if in_off_hours:
+        # Only scan major pairs during off-hours to conserve API credits
+        pairs_to_scan = [p for p in config.WATCHLIST if p in ["EUR/USD", "GBP/USD", "XAU/USD"]]
+        logger.info("Off-hours mode: scanning %d priority pairs only", len(pairs_to_scan))
+
+    logger.info("Scan started — %s — %d pairs", session_name, len(pairs_to_scan))
     await _broadcast("scanner_status", {
-        "message": f"Scanning {len(config.WATCHLIST)} pairs…",
+        "message": f"Scanning {len(pairs_to_scan)} pairs ({session_name})…",
         "scanning": True,
     })
 
     loop         = asyncio.get_event_loop()
     signals_sent = 0
 
-    for pair in config.WATCHLIST:
+    for pair in pairs_to_scan:
         if db.count_signals_last_hour() >= config.MAX_SIGNALS_PER_HOUR:
             break
 
@@ -183,11 +207,11 @@ async def scan_markets():
             logger.error("Error scanning %s: %s", pair, e, exc_info=True)
 
     await _broadcast("scanner_status", {
-        "message":   f"Scan complete — {signals_sent} signal(s) found",
+        "message":   f"Scan complete ({session_name}) — {signals_sent} signal(s) found",
         "scanning":  False,
         "last_scan": datetime.utcnow().isoformat(),
     })
-    logger.info("Scan complete. Signals: %d", signals_sent)
+    logger.info("Scan complete. Session: %s, Signals: %d", session_name, signals_sent)
 
 
 def _fetch_pair(pair: str):
@@ -277,12 +301,28 @@ async def run_trailing_stops():
 
 # ── Scheduler ─────────────────────────────────────────────────────────────
 
+def _get_scan_interval() -> int:
+    """Dynamically adjust scan interval based on trading session."""
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+
+    in_london = 7 <= hour < 16
+    in_ny = 12 <= hour < 21
+
+    # Use shorter interval during active sessions
+    if in_london or in_ny:
+        return config.SCAN_INTERVAL_ACTIVE_SECONDS
+    else:
+        return config.SCAN_INTERVAL_OFFHOURS_SECONDS
+
+
 def start_scheduler():
     now = datetime.now(timezone.utc)
+    initial_scan_interval = _get_scan_interval()
 
     _scheduler.add_job(
         scan_markets, "interval",
-        seconds=config.SCAN_INTERVAL_SECONDS,
+        seconds=initial_scan_interval,
         id="scan_markets", replace_existing=True,
         next_run_time=now + timedelta(seconds=10),
     )
@@ -307,8 +347,8 @@ def start_scheduler():
 
     _scheduler.start()
     logger.info(
-        "Scheduler started — scan=%ds results=%ds trailing=%ds account=60s",
-        config.SCAN_INTERVAL_SECONDS,
+        "Scheduler started — scan=%ds (session-adaptive) results=%ds trailing=%ds account=60s",
+        initial_scan_interval,
         config.RESULT_CHECK_INTERVAL_SECONDS,
         config.TRAILING_CHECK_INTERVAL_SECONDS,
     )

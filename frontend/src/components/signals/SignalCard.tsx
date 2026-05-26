@@ -1,5 +1,5 @@
 // src/components/signals/SignalCard.tsx
-import { TrendingUp, TrendingDown, Clock, CheckCircle, XCircle, AlertCircle } from 'lucide-react'
+import { TrendingUp, TrendingDown, Clock, CircleCheck as CheckCircle, Circle as XCircle, CircleAlert as AlertCircle } from 'lucide-react'
 import { Signal, useStore } from '../../store/useStore'
 
 interface Props { signal: Signal }
@@ -31,7 +31,6 @@ export function SignalCard({ signal }: Props) {
   const { setSelectedSignalId, selectedSignalId } = useStore()
   const isSelected = selectedSignalId === signal.id
   const StatusIcon = STATUS_ICON[signal.status] ?? Clock
-  const maxScore   = 8   // V1 scores out of 8
 
   const fmt = (p: number) =>
     signal.pair === 'XAU/USD'     ? p.toFixed(2)

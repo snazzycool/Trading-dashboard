@@ -1,6 +1,6 @@
 // src/App.tsx
 import { useEffect, useState, useCallback } from 'react'
-import { Activity, Play, Square, Wifi, WifiOff, BarChart2, Clock, List, TrendingUp, TrendingDown, Bell, BellOff, ChevronUp, X, DollarSign } from 'lucide-react'
+import { Activity, Play, Square, Wifi, WifiOff, ChartBar as BarChart2, List, Bell, BellOff, ChevronUp, X, DollarSign } from 'lucide-react'
 import { useStore } from './store/useStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useNotifications } from './hooks/useNotifications'
@@ -18,8 +18,6 @@ export default function App() {
 
   const selectedSignal = signals.find(s => s.id === selectedSignalId)
   const pendingCount   = signals.filter(s => s.status === 'PENDING').length
-  const winCount       = signals.filter(s => s.status === 'WIN').length
-  const lossCount      = signals.filter(s => s.status === 'LOSS').length
   const liveSignals    = signals.filter(s => s.status === 'PENDING')
   const historySignals = signals.filter(s => s.status !== 'PENDING')
 
@@ -65,15 +63,15 @@ export default function App() {
     <div className="min-h-screen bg-[#08080f] flex flex-col text-white">
 
       <header className="bg-[#0d0d1a] border-b border-white/5 sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
+        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between gap-4">
 
-          <div className="flex items-center gap-2.5 shrink-0">
-            <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/20">
-              <Activity size={15} className="text-white" />
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="w-9 h-9 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
+              <Activity size={16} className="text-white" />
             </div>
             <div className="hidden sm:block">
-              <p className="text-white font-bold text-sm leading-none">Signal Bot</p>
-              <p className="text-gray-500 text-xs mt-0.5">
+              <p className="text-white font-bold text-base leading-none">Signal Bot</p>
+              <p className="text-gray-500 text-xs mt-1">
                 {capitalConnected
                   ? <span className={capitalEnv === 'DEMO' ? 'text-yellow-500' : 'text-green-400'}>{capitalEnv} Mode</span>
                   : <span className="text-gray-600">Signal Only</span>}
@@ -81,61 +79,94 @@ export default function App() {
             </div>
           </div>
 
-          <div className="hidden md:flex items-center gap-2">
-            {[
-              { icon: Clock,        val: pendingCount, label: 'Live',   col: 'text-yellow-400', bg: 'bg-yellow-400/10 border-yellow-500/20' },
-              { icon: TrendingUp,   val: winCount,     label: 'Wins',   col: 'text-green-400',  bg: 'bg-green-400/10  border-green-500/20'  },
-              { icon: TrendingDown, val: lossCount,    label: 'Losses', col: 'text-red-400',    bg: 'bg-red-400/10    border-red-500/20'    },
-            ].map(({ icon: Icon, val, label, col, bg }) => (
-              <div key={label} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium ${bg} ${col}`}>
-                <Icon size={11} /><span className="font-bold">{val}</span><span className="opacity-70">{label}</span>
-              </div>
-            ))}
+          <div className="flex items-center gap-3">
             {capitalConnected && account && (
-              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium bg-blue-400/10 border-blue-500/20 text-blue-400">
-                <DollarSign size={11} />
-                <span className="font-bold">{account.currency} {account.balance.toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
-                {pnl !== 0 && <span className={pnlColor}>({pnl >= 0 ? '+' : ''}{pnl.toFixed(2)})</span>}
+              <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white/4 border border-white/8">
+                <DollarSign size={14} className="text-blue-400" />
+                <div className="flex flex-col">
+                  <p className="text-white font-bold text-sm leading-none">
+                    {account.currency} {account.balance.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                  </p>
+                  {pnl !== 0 && (
+                    <p className={`text-xs mt-0.5 ${pnlColor}`}>
+                      {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
-            {stats && stats.total > 0 && (
-              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium bg-purple-400/10 border-purple-500/20 text-purple-400">
-                <BarChart2 size={11} /><span className="font-bold">{stats.win_rate}%</span><span className="opacity-70">Win</span>
+
+            <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/4 border border-white/8">
+              <BarChart2 size={14} className="text-emerald-400" />
+              <div className="flex flex-col">
+                <p className="text-white font-bold text-sm leading-none">
+                  {stats?.win_rate ?? 0}%
+                </p>
+                <p className="text-gray-500 text-xs mt-0.5">Win Rate</p>
               </div>
-            )}
+            </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
             {isSupported && (
               <button onClick={handleNotifToggle}
-                className={`p-2 rounded-lg border transition-all ${notifEnabled ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' : 'bg-white/5 border-white/10 text-gray-500 hover:text-gray-300'}`}>
-                {notifEnabled ? <Bell size={15} /> : <BellOff size={15} />}
+                className={`p-2.5 rounded-lg border transition-all ${
+                  notifEnabled
+                    ? 'bg-blue-500/15 border-blue-500/30 text-blue-400'
+                    : 'bg-white/5 border-white/10 text-gray-500 hover:text-gray-300'
+                }`}
+                title={notifEnabled ? 'Disable notifications' : 'Enable notifications'}
+              >
+                {notifEnabled ? <Bell size={16} /> : <BellOff size={16} />}
               </button>
             )}
-            <button onClick={scannerActive ? stopScanner : startScanner} disabled={!connected}
-              className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-40 ${
+
+            <button
+              onClick={scannerActive ? stopScanner : startScanner}
+              disabled={!connected}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all disabled:opacity-40 ${
                 scannerActive
                   ? 'bg-red-500/15 text-red-400 border border-red-500/30 hover:bg-red-500/25'
                   : 'bg-green-500/15 text-green-400 border border-green-500/30 hover:bg-green-500/25'
-              }`}>
-              {scannerActive ? <><Square size={12} className="fill-current" />Stop</> : <><Play size={12} className="fill-current" />Start</>}
+              }`}
+            >
+              {scannerActive ? (
+                <><Square size={14} className="fill-current" />Stop</>
+              ) : (
+                <><Play size={14} className="fill-current" />Start</>
+              )}
             </button>
-            <div className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border ${connected ? 'bg-green-400/10 border-green-500/20 text-green-400' : 'bg-red-400/10 border-red-500/20 text-red-400'}`}>
-              {connected ? <Wifi size={12} /> : <WifiOff size={12} />}
+
+            <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg border ${
+              connected
+                ? 'bg-green-400/10 border-green-500/20 text-green-400'
+                : 'bg-red-400/10 border-red-500/20 text-red-400'
+            }`}>
+              {connected ? <Wifi size={13} /> : <WifiOff size={13} />}
               <span className="hidden sm:block font-medium">{connected ? 'Live' : 'Offline'}</span>
             </div>
           </div>
         </div>
 
         {(scannerActive || scannerStatus.scanning) && (
-          <div className="border-t border-white/5 bg-blue-500/5 px-4 py-1.5 flex items-center gap-2">
+          <div className="border-t border-white/5 bg-blue-500/5 px-4 py-2 flex items-center gap-3">
             {scannerStatus.scanning && (
-              <div className="flex gap-0.5">
-                {[0,1,2].map(i => <div key={i} className="w-1 h-3 bg-blue-400 rounded-full animate-bounce opacity-70" style={{ animationDelay: `${i*150}ms` }} />)}
+              <div className="flex gap-1">
+                {[0,1,2].map(i => (
+                  <div
+                    key={i}
+                    className="w-1 h-4 bg-blue-400 rounded-full animate-bounce opacity-70"
+                    style={{ animationDelay: `${i*150}ms` }}
+                  />
+                ))}
               </div>
             )}
-            <p className="text-blue-300/60 text-xs">{scannerStatus.message}</p>
-            {scannerStatus.last_scan && <p className="text-gray-600 text-xs ml-auto">{new Date(scannerStatus.last_scan + 'Z').toLocaleTimeString()}</p>}
+            <p className="text-blue-300/70 text-xs font-medium">{scannerStatus.message}</p>
+            {scannerStatus.last_scan && (
+              <p className="text-gray-600 text-xs ml-auto">
+                {new Date(scannerStatus.last_scan + 'Z').toLocaleTimeString()}
+              </p>
+            )}
           </div>
         )}
       </header>

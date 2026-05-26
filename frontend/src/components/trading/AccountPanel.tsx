@@ -1,5 +1,5 @@
 // src/components/trading/AccountPanel.tsx
-import { TrendingUp, TrendingDown, Wifi, WifiOff, DollarSign, Activity } from 'lucide-react'
+import { TrendingUp, TrendingDown, WifiOff, DollarSign, Activity } from 'lucide-react'
 import { useStore } from '../../store/useStore'
 
 export function AccountPanel() {
@@ -8,7 +8,6 @@ export function AccountPanel() {
   const equity   = (account?.balance ?? 0) + (account?.profit_loss ?? 0)
   const pnl      = account?.profit_loss ?? 0
   const pnlColor = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400'
-  const pnlIcon  = pnl > 0 ? TrendingUp : TrendingDown
 
   if (!capitalConnected) {
     return (

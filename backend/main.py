@@ -12,10 +12,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 import config
-from modules import database as db
+from modules import database as db_sqlite
+from modules import database_supabase as db_supabase
 from modules import scanner
+from modules import market_data as md
 from modules.capital_client import capital
 from modules.trade_executor import sync_open_positions
+
+# Use Supabase if configured, otherwise fall back to SQLite
+db = db_supabase if config.USE_SUPABASE else db_sqlite
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -189,6 +194,12 @@ def start_scanner():
 def stop_scanner():
     db.set_state("scanner_active", "off")
     return {"active": False}
+
+
+@app.get("/api/usage")
+def get_api_usage():
+    """Get TwelveData API usage statistics."""
+    return md.get_api_usage()
 
 
 # ── Serve React frontend ──────────────────────────────────────────────────

@@ -26,30 +26,47 @@ _RETRY_DELAY = 3
 
 # ── Cache ─────────────────────────────────────────────────────────────────
 _CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
-_CACHE_TTL = 60  # seconds
+_CACHE_TTL = 120  # increased to 2 minutes for better API efficiency
 
 # ── Per-minute rate limiter ───────────────────────────────────────────────
-# TwelveData free tier: max 8 calls per minute.
+# TwelveData free tier: max 8 calls per minute + 800 per day.
 # We enforce a minimum gap of 8 seconds between any two API calls
 # (60s / 8 calls = 7.5s per call → we use 8s to be safe).
-# This means 7 pairs × 2 timeframes = 14 calls takes ~112 seconds,
-# but all calls succeed without hitting the per-minute cap.
+# Smart caching reduces API calls by reusing data across scans.
 _RATE_LOCK        = threading.Lock()
 _LAST_CALL_TIME   = 0.0
 _MIN_CALL_GAP     = 8.0  # seconds between calls
+_DAILY_CALL_COUNT = 0
+_DAILY_RESET_DAY  = None
 
 
 def _rate_limited_get(params: dict) -> Optional[requests.Response]:
-    """Make a GET request, respecting the per-minute rate limit."""
-    global _LAST_CALL_TIME
+    """Make a GET request, respecting per-minute and daily rate limits."""
+    global _LAST_CALL_TIME, _DAILY_CALL_COUNT, _DAILY_RESET_DAY
+
     with _RATE_LOCK:
-        now     = time.time()
+        now = time.time()
         elapsed = now - _LAST_CALL_TIME
+
+        # Enforce minimum gap between calls
         if elapsed < _MIN_CALL_GAP:
             wait = _MIN_CALL_GAP - elapsed
             logger.debug("Rate limiter: sleeping %.1fs", wait)
             time.sleep(wait)
+
+        # Track daily usage
+        today = time.strftime("%Y-%m-%d")
+        if _DAILY_RESET_DAY != today:
+            _DAILY_RESET_DAY = today
+            _DAILY_CALL_COUNT = 0
+
+        # Check daily limit (leave 50 credit buffer)
+        if _DAILY_CALL_COUNT >= 750:
+            logger.warning("Daily API limit reached (750/800 credits used)")
+            return None
+
         _LAST_CALL_TIME = time.time()
+        _DAILY_CALL_COUNT += 1
 
     return requests.get(_BASE_URL, params=params, timeout=_TIMEOUT)
 
@@ -60,18 +77,36 @@ def get_candles(
     symbol: str,
     interval: str,
     bars: int = config.BARS_REQUIRED,
+    force_refresh: bool = False,
 ) -> Optional[pd.DataFrame]:
+    """
+    Fetch candles with intelligent caching.
+
+    Args:
+        symbol: Trading pair symbol
+        interval: Time interval (e.g., '15min', '1h')
+        bars: Number of bars to fetch
+        force_refresh: Bypass cache if True
+
+    Returns:
+        DataFrame with OHLCV data or None if error
+    """
     key = (symbol, interval)
     now = time.monotonic()
 
-    if key in _CACHE:
+    # Check cache (unless force refresh)
+    if not force_refresh and key in _CACHE:
         ts, df = _CACHE[key]
+        # Return cached data if still fresh
         if now - ts < _CACHE_TTL:
+            logger.debug("Cache hit: %s/%s (age: %.0fs)", symbol, interval, now - ts)
             return df
 
+    # Fetch new data
     df = _fetch(symbol, interval, bars)
     if df is not None:
         _CACHE[key] = (now, df)
+        logger.debug("Fetched fresh data: %s/%s", symbol, interval)
     return df
 
 
@@ -164,8 +199,27 @@ def _parse(payload: dict, symbol: str, interval: str) -> Optional[pd.DataFrame]:
 # ── Session filter ────────────────────────────────────────────────────────
 
 def is_active_session() -> bool:
+    """Check if current hour is within an active trading session."""
     if config.ACTIVE_SESSION_HOURS is None:
         return True
     from datetime import datetime, timezone
     hour = datetime.now(timezone.utc).hour
     return any(s <= hour < e for s, e in config.ACTIVE_SESSION_HOURS)
+
+
+def get_api_usage() -> dict:
+    """Return current API usage statistics."""
+    global _DAILY_CALL_COUNT, _DAILY_RESET_DAY
+    today = time.strftime("%Y-%m-%d")
+
+    # Reset if new day
+    if _DAILY_RESET_DAY != today:
+        _DAILY_RESET_DAY = today
+        _DAILY_CALL_COUNT = 0
+
+    return {
+        "daily_calls": _DAILY_CALL_COUNT,
+        "daily_limit": 800,
+        "remaining": 800 - _DAILY_CALL_COUNT,
+        "percent_used": round(_DAILY_CALL_COUNT / 800 * 100, 1),
+    }

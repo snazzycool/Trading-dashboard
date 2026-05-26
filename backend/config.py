@@ -17,12 +17,19 @@ CAPITAL_PASSWORD:   str = os.getenv("CAPITAL_PASSWORD",   "")
 CAPITAL_IDENTIFIER: str = os.getenv("CAPITAL_IDENTIFIER", "")
 CAPITAL_ENV:        str = os.getenv("CAPITAL_ENV", "demo")  # "demo" or "live"
 
-# ── Database ──────────────────────────────────────────────────────────────
+# ── Database (Supabase) ─────────────────────────────────────────────────────
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+# Legacy SQLite (fallback if Supabase not configured)
 _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.join(
     os.path.dirname(__file__), "data"
 )
 os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH: str = os.path.join(_DATA_DIR, "signals.db")
+
+# Use Supabase if credentials are available
+USE_SUPABASE: bool = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 # ── Watchlist ─────────────────────────────────────────────────────────────
 WATCHLIST: list[str] = [
@@ -39,15 +46,18 @@ HTF_INTERVAL:   str = "1h"
 BARS_REQUIRED:  int = 250
 
 # ── Scan schedule ─────────────────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS: int         = 1800  # 30 min (safe for free tier)
-RESULT_CHECK_INTERVAL_SECONDS: int = 1800  # 30 min
-TRAILING_CHECK_INTERVAL_SECONDS: int = 60  # check trailing stops every 60s
+# Adaptive scanning based on trading sessions
+SCAN_INTERVAL_ACTIVE_SECONDS: int   = 1800   # 30 min during active sessions
+SCAN_INTERVAL_OFFHOURS_SECONDS: int = 3600   # 60 min during off-hours (saves API credits)
+RESULT_CHECK_INTERVAL_SECONDS: int  = 1800   # 30 min
+TRAILING_CHECK_INTERVAL_SECONDS: int = 60    # check trailing stops every 60s
 
-# Session hours (UTC) — scanner runs 24/7 but these inform strategy
+# Session hours (UTC) — used for session-aware scanning
 ACTIVE_SESSION_HOURS: list[tuple[int, int]] = [
-    (7, 16),   # London
-    (12, 21),  # New York
+    (7, 16),   # London   (07:00-16:00 UTC)
+    (12, 21),  # New York (12:00-21:00 UTC)
 ]
+OFF_HOURS_PAIRS: list[str] = ["EUR/USD", "GBP/USD", "XAU/USD"]  # Priority pairs during off-hours
 
 # ── V1 Scoring model (max 8, min 5) ──────────────────────────────────────
 MIN_SCORE_TO_TRADE: int = 5
